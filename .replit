@@ -1,11 +1,15 @@
-# Dit vertelt Replit welke taal en welke file hij moet starten
-run = "python3 test_api.py"
+entrypoint = "main.py"
+modules = ["python-3.11"]
 
+[nix]
+channel = "stable-25_05"
+
+[unitTest]
 language = "python3"
 
-# Optioneel: geef aan waar je packages staan
-[packager]
-packages  ["ccxt"]
+[gitHubImport]
+requiredFiles = [".replit", "replit.nix"]
 
-# Dit stuk is optioneel maar handig als Replit vraagt om dependencies
-[unit_tests]
+[deployment]
+run = ["python3", "main.py"]
+deploymentTarget = "cloudrun"
