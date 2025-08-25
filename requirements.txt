@@ -1,3 +1,4 @@
-ccxt>=4.1.0
-pandas>=2.0.0
-tzdata>=2023.3
+ccxt==4.4.37
+pandas==2.2.3
+tzdata==2024.1
+flask==3.1.0
