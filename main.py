@@ -1,298 +1,259 @@
 # main.py
-import os
-import time
-import math
+# LIVE GRID/MA BOT (Bitvavo) met trailing stops, SL/TP, anti double-buy,
+# logt naar trades.csv en print nette regels in Render logs.
+
+import os, time, csv, pathlib, random, json
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+import pandas as pd
 import ccxt
-import logging
-from datetime import datetime
 
-# -----------------------------
-# Logging
-# -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+from keep_alive import keep_alive
+keep_alive()  # klein webservertje
 
-def _mask(s: str | None) -> str:
-    if not s:
-        return "MISSING"
-    return s[:4] + "..." + s[-4:]
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
+def log(msg: str):  # alles naar Render logs
+    print(f"[{now_iso()}] {msg}")
 
-# -----------------------------
-# Env
-# -----------------------------
-API_KEY  = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-OPERATOR_ID = os.getenv("OPERATOR_ID")
+# ------------------ ENV ------------------
+SYMBOL   = os.getenv("SYMBOL", "ETH/EUR").upper()
+TIMEFRAME= os.getenv("TIMEFRAME", "1m")
+FAST     = int(os.getenv("FAST", "3"))
+SLOW     = int(os.getenv("SLOW", "6"))
 
-SYMBOL = os.getenv("SYMBOL", "ETH/EUR")
-BASE, QUOTE = SYMBOL.split("/")
-
-LIVE = True   # deze worker is live
-
-EUR_PER_TRADE = float(os.getenv("EUR_PER_TRADE", "15"))
+LIVE     = os.getenv("LIVE", "true").lower() in ("1","true","yes","y")
+EUR_PER_TRADE     = float(os.getenv("EUR_PER_TRADE", "15"))
 MAX_EUR_PER_TRADE = float(os.getenv("MAX_EUR_PER_TRADE", "20"))
+
+STOP_LOSS   = float(os.getenv("STOP_LOSS", "0.01"))
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.03"))
+TRAIL_TRIGGER = float(os.getenv("TRAIL_TRIGGER", "0.02"))
+TRAIL_START   = float(os.getenv("TRAIL_START", "0.015"))
+TRAIL_GAP     = float(os.getenv("TRAIL_GAP", "0.01"))
+
+LOCK_PREEXISTING_BALANCE = os.getenv("LOCK_PREEXISTING_BALANCE", "false").lower() in ("1","true","yes","y")
+
+# anti-dubbel
+ONE_POSITION_ONLY     = os.getenv("ONE_POSITION_ONLY","true").lower() in ("1","true","yes","y")
 MAX_BUYS_PER_POSITION = int(os.getenv("MAX_BUYS_PER_POSITION", "1"))
-ONE_POSITION_ONLY = os.getenv("ONE_POSITION_ONLY", "true").lower() == "true"
+TRADE_COOLDOWN_SEC    = int(os.getenv("TRADE_COOLDOWN_SEC", "180"))
+COOLDOWN_SEC          = int(os.getenv("COOLDOWN_SEC", "120"))
+ORDER_ID_PREFIX       = os.getenv("ORDER_ID_PREFIX", "gridbot")
+OPERATOR_ID           = os.getenv("OPERATOR_ID","").strip()
 
-STOP_LOSS   = float(os.getenv("STOP_LOSS", "0.01"))   # 1% vaste SL
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.03")) # 3% vaste TP
+SLEEP_SEC     = float(os.getenv("SLEEP_SEC","60"))
+MAX_RETRIES   = int(os.getenv("MAX_RETRIES","5"))
+BACKOFF_BASE  = float(os.getenv("BACKOFF_BASE","1.5"))
+REQ_INTERVAL  = float(os.getenv("REQUEST_INTERVAL_SEC","1.0"))
 
-TRAIL_TRIGGER = float(os.getenv("TRAIL_TRIGGER", "0.02"))  # activeer bij +2%
-TRAIL_START   = float(os.getenv("TRAIL_START", "0.015"))   # eerste lock bij +1.5%
-TRAIL_GAP     = float(os.getenv("TRAIL_GAP", "0.01"))      # trailing 1% onder piek
+API_KEY    = os.getenv("API_KEY","")
+API_SECRET = os.getenv("API_SECRET","")
 
-SLEEP_SEC = int(os.getenv("SLEEP_SEC", "60"))
-TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "180"))  # na trade even afkoelen
-
-REQUEST_INTERVAL_SEC = float(os.getenv("REQUEST_INTERVAL_SEC", "1.0"))
-
-logging.info(f"[START] {datetime.now()} | LIVE={LIVE} | Symbol={SYMBOL}")
-logging.info(f"API_KEY={_mask(API_KEY)} | API_SECRET={_mask(API_SECRET)} | operatorId={OPERATOR_ID}")
-
-
-# -----------------------------
-# Exchange
-# -----------------------------
 if not API_KEY or not API_SECRET:
-    raise SystemExit("GEEN API SLEUTELS: zet API_KEY en API_SECRET in Secrets.")
+    raise SystemExit("GEEN API KEYS (API_KEY/API_SECRET)")
 
-ex = ccxt.bitvavo({
-    "apiKey": API_KEY,
-    "secret": API_SECRET,
-    "enableRateLimit": True,
-})
-# Zorg dat operatorId ALTIJD meegaat
-ex.options["operatorId"] = OPERATOR_ID
+LOG_TRADES      = os.getenv("LOG_TRADES","true").lower() in ("1","true","yes","y")
+LOG_SUMMARY_SEC = int(os.getenv("LOG_SUMMARY_SEC","600"))
 
+DATA_DIR   = pathlib.Path(".")
+TRADES_CSV = DATA_DIR / "trades.csv"
+
+def append_trade(row):
+    new = not TRADES_CSV.exists()
+    with open(TRADES_CSV,"a",newline="",encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["timestamp","symbol","side","price","amount_or_cost","fee","cash_eur_after","reason"])
+        w.writerow(row)
+
+# ------------------ Exchange ------------------
+ex = ccxt.bitvavo({"apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True})
+ex.options["createMarketBuyOrderRequiresPrice"] = False
 markets = ex.load_markets()
 if SYMBOL not in markets:
-    raise SystemExit(f"{SYMBOL} niet gevonden op Bitvavo.")
+    raise SystemExit(f"Symbool {SYMBOL} niet op Bitvavo.")
 
-market = markets[SYMBOL]
-amount_prec = market.get("precision", {}).get("amount", None)
-price_prec = market.get("precision", {}).get("price", None)
-limits = market.get("limits", {}) or {}
-MIN_BASE  = float((limits.get("amount") or {}).get("min") or 0.0)   # min base
-MIN_QUOTE = float((limits.get("cost")   or {}).get("min") or 0.0)   # min EUR
-logging.info(f"[INFO] Minima {SYMBOL}: min_cost=€{MIN_QUOTE}, min_amount={MIN_BASE}")
+BASE, QUOTE = SYMBOL.split("/")
+_limits = markets[SYMBOL].get("limits", {})
+MIN_BASE  = float((_limits.get("amount") or {}).get("min") or 0.0)
+MIN_QUOTE = float((_limits.get("cost")   or {}).get("min") or 0.0)
+log(f"Minima {SYMBOL}: min_cost=€{MIN_QUOTE}, min_amount={MIN_BASE} {BASE}")
 
-# -----------------------------
-# Helpers
-# -----------------------------
+def amount_to_precision(symbol: str, amount: float) -> float:
+    return float(ex.amount_to_precision(symbol, amount))
+
+# rate limit helper
 _last_call = 0.0
 def throttle():
     global _last_call
-    now = time.time()
-    wait = REQUEST_INTERVAL_SEC - (now - _last_call)
-    if wait > 0:
-        time.sleep(wait)
+    wait = REQ_INTERVAL - (time.time() - _last_call)
+    if wait > 0: time.sleep(wait)
     _last_call = time.time()
 
-def amount_to_precision(amount: float) -> float:
-    """Rond hoeveelheid naar exchange-precision af (neerwaarts)."""
-    if amount_prec is None:
-        return float(ex.amount_to_precision(SYMBOL, amount))
-    q = 10 ** amount_prec
-    return math.floor(amount * q) / q
+def with_retry(call, *args, **kwargs):
+    delay = 1.0
+    for i in range(1, MAX_RETRIES+1):
+        try:
+            throttle()
+            return call(*args, **kwargs)
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:
+            time.sleep(delay)
+            delay *= BACKOFF_BASE
+        except Exception as e:
+            time.sleep(1.0)
+    raise RuntimeError("Max retries exceeded")
 
-def price_to_precision(price: float) -> float:
-    if price_prec is None:
-        return float(ex.price_to_precision(SYMBOL, price))
-    q = 10 ** price_prec
-    return math.floor(price * q) / q
+# ------------------ Signaal ------------------
+def fetch_df(limit=SLOW+5) -> pd.DataFrame:
+    o = with_retry(ex.fetch_ohlcv, SYMBOL, timeframe=TIMEFRAME, limit=limit)
+    return pd.DataFrame(o, columns=["t","o","h","l","c","v"])
 
-def get_balance(asset: str) -> float:
-    throttle()
-    bal = ex.fetch_balance()
-    return float((bal.get("free", {}) or {}).get(asset, 0.0))
-
-def get_last_price() -> float:
-    throttle()
-    t = ex.fetch_ticker(SYMBOL)
-    return float(t["last"])
-
-def clamp_spend_eur(eur_free: float, px: float) -> float:
-    """Bepaal spend in EUR incl. beurs-minima & CAP."""
-    spend = min(eur_free, MAX_EUR_PER_TRADE, EUR_PER_TRADE)
-    # moet voldoen aan min_cost OF min_amount
-    need_eur = max(MIN_QUOTE, MIN_BASE * px, 0.50)
-    if spend < need_eur:
-        # probeer op te hogen tot need_eur binnen cap en saldo
-        spend = min(max(need_eur, EUR_PER_TRADE), MAX_EUR_PER_TRADE, eur_free)
-    return round(spend, 2)
-
-def create_market_buy_by_eur(spend_eur: float):
-    params = {"operatorId": OPERATOR_ID, "cost": spend_eur}
-    throttle()
-    return ex.create_order(SYMBOL, "market", "buy", None, None, params)
-
-def create_market_sell_amount(amount_base: float):
-    params = {"operatorId": OPERATOR_ID}
-    throttle()
-    return ex.create_order(SYMBOL, "market", "sell", amount_base, None, params)
-
-# -----------------------------
-# Trade-state
-# -----------------------------
-position_amt = 0.0           # hoeveelheid BASE die deze sessie heeft (opgebouwd)
-entry_price: float | None = None
-buys_count = 0
-last_trade_ts = 0.0
-
-# trailing
-trail_active = False
-trail_peak = None
-trail_floor = None
-
-def reset_trailing():
-    global trail_active, trail_peak, trail_floor
-    trail_active = False
-    trail_peak = None
-    trail_floor = None
-
-def cooldown_active() -> bool:
-    return (time.time() - last_trade_ts) < TRADE_COOLDOWN_SEC
-
-# -----------------------------
-# Strategie: eenvoudige MA cross?
-# (we houden het nu bij “HOLD” → jij kunt hier later signaal inbouwen)
-# Voor demo: we gebruiken een dummy: Koop als positie leeg; Verkoop op SL/TP/Trailing
-# -----------------------------
-def decide_signal(px: float) -> str:
-    # hier zou je een echte strategie kunnen plakken (MA cross e.d.)
-    # Voorbeeld: als we geen positie hebben -> BUY
-    #            als wel positie -> HOLD (verkoop regelt SL/TP/Trailing)
-    if position_amt <= 0.0:
-        return "BUY"
+def signal(df: pd.DataFrame) -> str:
+    if len(df) < max(FAST,SLOW)+2:
+        return "HOLD"
+    f = df["c"].rolling(FAST).mean()
+    s = df["c"].rolling(SLOW).mean()
+    if f.iloc[-2] > s.iloc[-2] and f.iloc[-3] <= s.iloc[-3]: return "BUY"
+    if f.iloc[-2] < s.iloc[-2] and f.iloc[-3] >= s.iloc[-3]: return "SELL"
     return "HOLD"
 
+# ------------------ State ------------------
+state = {
+    "start_bal": with_retry(ex.fetch_balance).get("free",{}),
+    "position_amt": 0.0,
+    "entry_price": None,
+    "trail_active": False, "trail_peak": None, "trail_floor": None,
+    "last_trade_ts": 0.0,
+    "buys_this_position": 0,
+}
+start_eur  = float(state["start_bal"].get(QUOTE,0) or 0)
+start_base = float(state["start_bal"].get(BASE,0)  or 0)
 
-# -----------------------------
-# Main loop
-# -----------------------------
-def run():
-    global position_amt, entry_price, buys_count, last_trade_ts
-    global trail_active, trail_peak, trail_floor
+def avail_for_bot() -> Dict[str,float]:
+    bal = with_retry(ex.fetch_balance).get("free",{})
+    eur = float(bal.get(QUOTE,0) or 0)
+    base= float(bal.get(BASE ,0) or 0)
+    if LOCK_PREEXISTING_BALANCE:
+        return {"eur":max(0.0, eur-start_eur), "base":max(0.0, base-start_base)}
+    return {"eur":eur, "base":base}
 
-    logging.info(
-        f"[PARAMS] €/trade={EUR_PER_TRADE} | CAP={MAX_EUR_PER_TRADE} "
-        f"| ONE_POS={ONE_POSITION_ONLY} | MAX_BUYS={MAX_BUYS_PER_POSITION} "
-        f"| SL={STOP_LOSS*100:.1f}% | TP={TAKE_PROFIT*100:.1f}% "
-        f"| TRIGGER={TRAIL_TRIGGER*100:.1f}% | TSTART={TRAIL_START*100:.1f}% | TGAP={TRAIL_GAP*100:.1f}%"
-    )
+def reset_trailing():
+    state["trail_active"]=False; state["trail_peak"]=None; state["trail_floor"]=None
 
-    while True:
-        try:
-            px = get_last_price()
-            eur_free = get_balance(QUOTE)
-            base_free = get_balance(BASE)
+def maybe_trailing(px: float):
+    if state["entry_price"] is None or state["position_amt"]<=0: return
+    chg = (px - state["entry_price"]) / state["entry_price"]
 
-            # Voor de zekerheid: hanteer wat de bot denkt dat hij bezit (max op daadwerkelijke free)
-            if position_amt > 0:
-                position_amt = min(position_amt, base_free)
+    if not state["trail_active"] and chg >= TRAIL_TRIGGER:
+        state["trail_active"]=True
+        state["trail_peak"]=px
+        state["trail_floor"]=max(state["entry_price"]*(1+TRAIL_START), px*(1-TRAIL_GAP))
+        log(f"[TRAIL] Activated peak=€{state['trail_peak']:.6f} floor=€{state['trail_floor']:.6f}")
 
-            logging.info(f"Prijs: €{px:.4f} | Signaal: {decide_signal(px)}")
-            logging.debug(f"[DEBUG] Vrij {QUOTE}(bot): {eur_free:.2f} | Vrij {BASE}(bot): {base_free:.6f}")
+    if state["trail_active"]:
+        if px > state["trail_peak"]:
+            state["trail_peak"]=px
+            state["trail_floor"]=state["trail_peak"]*(1-TRAIL_GAP)
+        if px <= state["trail_floor"]:
+            # verkoop alles binnen limieten
+            sell_sz = min(state["position_amt"], avail_for_bot()["base"])
+            sell_sz = amount_to_precision(SYMBOL, sell_sz)
+            if sell_sz >= MIN_BASE and (sell_sz*px) >= max(MIN_QUOTE,0.5):
+                params={}
+                if OPERATOR_ID: params["operatorId"]=OPERATOR_ID
+                with_retry(ex.create_order, SYMBOL, "market", "sell", sell_sz, None, params)
+                state["position_amt"] -= sell_sz
+                append_trade([now_iso(),SYMBOL,"SELL",f"{px:.6f}",f"{sell_sz:.8f}","-",f"{avail_for_bot()['eur']:.2f}","TRAILING_STOP"])
+                if LOG_TRADES: log(f"{SYMBOL} SELL {sell_sz:.8f} @ €{px:.6f} (trailing)")
+                if state["position_amt"]<=0: state["entry_price"]=None; reset_trailing()
 
-            # ======== SL/TP + TRAILING ========
-            if position_amt > 0 and entry_price:
-                change = (px - entry_price) / entry_price
+def do_buy(px: float):
+    # cooldown
+    if time.time() - state["last_trade_ts"] < TRADE_COOLDOWN_SEC:
+        return
+    if ONE_POSITION_ONLY and state["position_amt"]>0:
+        return
+    if state["buys_this_position"] >= MAX_BUYS_PER_POSITION:
+        return
 
-                # Trailing: triggeren?
-                if not trail_active and change >= TRAIL_TRIGGER:
-                    trail_active = True
-                    trail_peak = px
-                    start_lock = entry_price * (1 + TRAIL_START)
-                    trail_floor = max(start_lock, trail_peak * (1 - TRAIL_GAP))
-                    logging.info(f"[TRAIL] Activated. peak=€{trail_peak:.6f} floor=€{trail_floor:.6f}")
+    avail = avail_for_bot()["eur"]
+    target = min(EUR_PER_TRADE, MAX_EUR_PER_TRADE, avail)
+    need_min = max(MIN_QUOTE, MIN_BASE*px, 0.50)
+    if target < need_min:
+        return
 
-                if trail_active:
-                    if px > trail_peak:
-                        trail_peak = px
-                        trail_floor = trail_peak * (1 - TRAIL_GAP)
-                    if px <= trail_floor:
-                        to_sell = amount_to_precision(position_amt)
-                        if to_sell >= max(MIN_BASE, 0.0) and (to_sell * px) >= max(MIN_QUOTE, 0.5):
-                            create_market_sell_amount(to_sell)
-                            logging.info(f"[TRAIL] SELL {to_sell} {BASE} @ €{px:.6f} (peak=€{trail_peak:.6f})")
-                            position_amt = 0.0
-                            entry_price = None
-                            buys_count = 0
-                            last_trade_ts = time.time()
-                            reset_trailing()
-                            time.sleep(SLEEP_SEC)
-                            continue
+    spend = round(target,2)
+    params = {"cost": spend}
+    if OPERATOR_ID: params["operatorId"]=OPERATOR_ID
+    order = with_retry(ex.create_order, SYMBOL, "market", "buy", None, None, params)
 
-                # Vaste TP/SL
-                if change >= TAKE_PROFIT or change <= -STOP_LOSS:
-                    reason = "TP" if change >= TAKE_PROFIT else "SL"
-                    to_sell = amount_to_precision(position_amt)
-                    if to_sell >= max(MIN_BASE, 0.0) and (to_sell * px) >= max(MIN_QUOTE, 0.5):
-                        create_market_sell_amount(to_sell)
-                        logging.info(f"[LIVE] {reason} SELL {to_sell} {BASE} @ €{px:.6f} ({change*100:+.2f}%)")
-                        position_amt = 0.0
-                        entry_price = None
-                        buys_count = 0
-                        last_trade_ts = time.time()
-                        reset_trailing()
-                        time.sleep(SLEEP_SEC)
-                        continue
+    try:
+        filled = float(order.get("info",{}).get("filledAmount") or 0.0)
+    except Exception:
+        filled = spend/px
+    state["position_amt"] += filled
+    if state["entry_price"] is None: state["entry_price"]=px
+    state["last_trade_ts"] = time.time()
+    state["buys_this_position"] += 1
+    append_trade([now_iso(),SYMBOL,"BUY",f"{px:.6f}",f"€{spend:.2f}","-",f"{avail_for_bot()['eur']:.2f}","SIGNAL"])
+    if LOG_TRADES: log(f"{SYMBOL} BUY ~€{spend:.2f} (+{filled:.6f}) @ €{px:.6f}")
 
-            # ======== SELL signaal vanuit strategie? (optioneel) ========
-            # In dit simpele voorbeeld doen we dat niet; verkoop komt via SL/TP/Trailing.
+def do_sell(px: float, reason: str):
+    if state["position_amt"]<=0: return
+    avail = avail_for_bot()["base"]
+    sell_sz = min(state["position_amt"], avail, MAX_EUR_PER_TRADE/px)
+    sell_sz = amount_to_precision(SYMBOL, sell_sz)
+    if sell_sz < MIN_BASE or (sell_sz*px) < max(MIN_QUOTE,0.5):
+        return
+    params={}
+    if OPERATOR_ID: params["operatorId"]=OPERATOR_ID
+    with_retry(ex.create_order, SYMBOL, "market", "sell", sell_sz, None, params)
+    state["position_amt"] -= sell_sz
+    if state["position_amt"]<=0:
+        state["entry_price"]=None
+        state["buys_this_position"]=0
+        reset_trailing()
+    state["last_trade_ts"] = time.time()
+    append_trade([now_iso(),SYMBOL,"SELL",f"{px:.6f}",f"{sell_sz:.8f}","-",f"{avail_for_bot()['eur']:.2f}",reason])
+    if LOG_TRADES: log(f"{SYMBOL} SELL {sell_sz:.8f} @ €{px:.6f} ({reason})")
 
-            # ======== BUY ========
-            sig = decide_signal(px)
-            if sig == "BUY":
-                # position rules
-                if ONE_POSITION_ONLY and position_amt > 0:
-                    logging.info("[LIVE] ONE_POSITION_ONLY actief: reeds positie → geen BUY.")
-                elif buys_count >= MAX_BUYS_PER_POSITION:
-                    logging.info("[LIVE] MAX_BUYS_PER_POSITION bereikt → geen BUY.")
-                elif cooldown_active():
-                    left = TRADE_COOLDOWN_SEC - int(time.time() - last_trade_ts)
-                    logging.info(f"[LIVE] In cooldown ({left}s) → geen BUY.")
-                else:
-                    spend = clamp_spend_eur(eur_free, px)
-                    if spend < max(MIN_QUOTE, MIN_BASE * px, 0.50):
-                        logging.info(f"[LIVE] BUY overslaan: bedrag te klein (nodig ≥ max({MIN_BASE:.6f} {BASE}, €{MIN_QUOTE:.2f})).")
-                    else:
-                        # bereken hoeveelheid en pas precision toe
-                        est_amount = spend / px
-                        amt = amount_to_precision(est_amount)
-                        if amt < max(MIN_BASE, 0.0) or (amt * px) < max(MIN_QUOTE, 0.50):
-                            logging.info("[LIVE] BUY overslaan (na precision/minima).")
-                        else:
-                            # op Bitvavo market-buy: fijner met 'cost' param (EUR)
-                            order = create_market_buy_by_eur(spend)
-                            # fallback filledAmount uit info
-                            filled = None
-                            try:
-                                filled = float(order.get("info", {}).get("filledAmount"))
-                            except Exception:
-                                pass
-                            if not filled:
-                                filled = amt
-                            position_amt += filled
-                            entry_price = px  # reset entry op laatste buy
-                            buys_count += 1
-                            last_trade_ts = time.time()
-                            reset_trailing()
-                            logging.info(f"[LIVE] BUY €{spend:.2f} {BASE} (+{filled:.6f}) @ €{px:.6f}")
+# ------------------ Main loop ------------------
+log(f"START | {SYMBOL} | TF={TIMEFRAME} | live={LIVE} | €/trade={EUR_PER_TRADE} | SL={STOP_LOSS*100:.1f}% | TP={TAKE_PROFIT*100:.1f}%")
+last_summary = 0.0
 
-            time.sleep(SLEEP_SEC)
+while True:
+    try:
+        df = fetch_df()
+        px = float(df["c"].iloc[-1])
+        sig = signal(df)
+        if LOG_TRADES: log(f"Prijs=€{px:.4f} | Signaal={sig}")
 
-        except KeyboardInterrupt:
-            logging.info("Gestopt door gebruiker.")
-            break
-        except Exception as e:
-            logging.error(f"[ERROR] Runtime: {e!r}")
-            time.sleep(3)
+        # trailing + SL/TP
+        maybe_trailing(px)
+        if state["entry_price"]:
+            chg = (px - state["entry_price"]) / state["entry_price"]
+            if chg >= TAKE_PROFIT:
+                do_sell(px, "TAKE_PROFIT")
+            elif chg <= -STOP_LOSS:
+                do_sell(px, "STOP_LOSS")
 
+        # signaal-acties
+        if sig == "BUY":
+            do_buy(px)
+        elif sig == "SELL":
+            do_sell(px, "SIGNAL")
 
-if __name__ == "__main__":
-    run()
+        # periodieke samenvatting
+        if LOG_SUMMARY_SEC > 0 and time.time() - last_summary >= LOG_SUMMARY_SEC:
+            a = avail_for_bot()
+            log(f"SUMMARY cash=€{a['eur']:.2f} pos={state['position_amt']:.6f} {BASE} entry={state['entry_price'] if state['entry_price'] else '-'}")
+            last_summary = time.time()
+
+        time.sleep(SLEEP_SEC)
+    except KeyboardInterrupt:
+        break
+    except Exception as e:
+        log(f"[runtime] {e}")
+        time.sleep(5)
