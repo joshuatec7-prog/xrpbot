@@ -1,42 +1,77 @@
 # paper_grid.py
-# 24/7 PAPER GRID BOT (Bitvavo public data only)
-# - Grid per pair op basis van P10–P90 van 30d 1h data (fallback: median ± BAND_PCT)
-# - Virtuele fills (paper), fees, PnL, persistente state
-# - Logt trades.csv en equity.csv; state.json voor herstel
+# ------------------------------------------------------------
+# 24/7 PAPER GRID BOT (paper trading, publiekemarktdata via ccxt)
+# - Persistente bestanden in /data (als aanwezig) anders projectmap
+# - Grid per pair op basis van P10–P90 (30d 1h); fallback: ±BAND_PCT
+# - Virtuele fills (paper), fees, PnL, state.json voor recover
+# - trades.csv (alle fills) en equity.csv (dagelijks MTM-totaal)
+# ------------------------------------------------------------
 
 import os, json, time, math, csv, random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import ccxt
 import pandas as pd
 
-# ------------------ Config via ENV ------------------
-CAPITAL_EUR = float(os.getenv("CAPITAL_EUR", "15000"))
-COINS_CSV   = os.getenv("COINS", "BTC/EUR,ETH/EUR,SOL/EUR,XRP/EUR,LTC/EUR")
-WEIGHTS_CSV = os.getenv("WEIGHTS", "").strip()
+# ====== Helper: pad naar persistente data ======
+def resolve_data_dir() -> Path:
+    candidates = [
+        Path(os.getenv("DATA_DIR", "")),                 # expliciete override
+        Path("/opt/render/project/src/data"),           # aanbevolen Render pad
+        Path("/data"),                                  # alternatieve mount
+        Path(".")                                       # fallback
+    ]
+    for p in candidates:
+        if p and str(p) != "" and (p == Path(".") or p.exists()):
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+                return p
+            except Exception:
+                continue
+    return Path(".")
+
+DATA_DIR: Path = resolve_data_dir()
+
+STATE_FILE  = DATA_DIR / "state.json"
+TRADES_CSV  = DATA_DIR / "trades.csv"
+EQUITY_CSV  = DATA_DIR / "equity.csv"
+
+# ====== Config via ENV ======
+def _f(env: str, default: str) -> float:
+    try:
+        return float(os.getenv(env, default))
+    except Exception:
+        return float(default)
+
+CAPITAL_EUR = _f("CAPITAL_EUR", "15000")
+
+COINS_CSV = os.getenv(
+    "COINS",
+    "BTC/EUR,ETH/EUR,SOL/EUR,XRP/EUR,LTC/EUR"
+)
+
+# Weights "PAIR:WEIGHT,PAIR:WEIGHT" — normaliseren we automatisch
+WEIGHTS_CSV = os.getenv("WEIGHTS", "BTC/EUR:0.35,ETH/EUR:0.30,SOL/EUR:0.15,XRP/EUR:0.10,LTC/EUR:0.10")
 
 GRID_LEVELS = int(os.getenv("GRID_LEVELS", "24"))
-BAND_PCT    = float(os.getenv("BAND_PCT", "0.20"))      # fallback ±20%
-FEE_PCT     = float(os.getenv("FEE_PCT", "0.0015"))     # 0.15%
-SLEEP_SEC   = float(os.getenv("SLEEP_SEC", "30"))
+BAND_PCT    = _f("BAND_PCT", "0.20")        # ±20% rondom last (fallback)
+FEE_PCT     = _f("FEE_PCT", "0.0015")       # 0.15% per order
+SLEEP_SEC   = _f("SLEEP_SEC", "30")
 EXCHANGE_ID = os.getenv("EXCHANGE", "bitvavo")
 
-# logopties
-LOG_TRADES      = os.getenv("LOG_TRADES", "true").lower() in ("1","true","yes","y")
-LOG_SUMMARY_SEC = int(os.getenv("LOG_SUMMARY_SEC", "600"))
-
-DATA_DIR   = Path(".")
-STATE_FILE = DATA_DIR / "state_paper.json"
-TRADES_CSV = DATA_DIR / "paper_trades.csv"
-EQUITY_CSV = DATA_DIR / "paper_equity.csv"
-
+# ====== Kleine helpers ======
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
-def log(msg: str):
-    print(f"[{now_iso()}] {msg}")
+def append_csv(path: Path, row: List[str], header: List[str]):
+    new = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(header)
+        w.writerow(row)
 
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -51,76 +86,69 @@ def save_state(state: dict):
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(STATE_FILE)
 
-def append_csv(path: Path, row: List):
-    new = not path.exists()
-    with path.open("a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if new:
-            if path == TRADES_CSV:
-                w.writerow(["timestamp","pair","side","price","amount","fee_eur","cash_eur","coin","coin_qty","realized_pnl_eur","comment"])
-            elif path == EQUITY_CSV:
-                w.writerow(["date","total_equity_eur"])
-        w.writerow(row)
-
-# ------------------ Exchange (public) ------------------
+# ====== Exchange (public data) ======
 def make_ex():
     klass = getattr(ccxt, EXCHANGE_ID)
     ex = klass({"enableRateLimit": True})
     ex.load_markets()
     return ex
 
+# ====== Grid bouw ======
 def geometric_levels(low: float, high: float, n: int) -> List[float]:
     if low <= 0 or high <= 0 or n < 2:
         return [low, high]
-    ratio = (high / low) ** (1 / (n - 1))
-    return [low * (ratio ** i) for i in range(n)]
+    r = (high / low) ** (1 / (n - 1))
+    return [low * (r ** i) for i in range(n)]
 
 def compute_band_from_history(ex, pair: str) -> Tuple[float, float]:
     try:
         ohlcv = ex.fetch_ohlcv(pair, timeframe="1h", limit=24*30)
-        if not ohlcv or len(ohlcv) < 50:
-            raise ValueError("te weinig data")
-        closes = [c[4] for c in ohlcv]
-        s = pd.Series(closes)
-        p10 = float(s.quantile(0.10))
-        p90 = float(s.quantile(0.90))
-        if p90 > p10 > 0:
-            return p10, p90
+        closes = [c[4] for c in ohlcv] if ohlcv else []
+        if len(closes) >= 50:
+            s = pd.Series(closes)
+            p10 = float(s.quantile(0.10))
+            p90 = float(s.quantile(0.90))
+            if p90 > p10 > 0:
+                return p10, p90
     except Exception:
         pass
+    # fallback: ± band rond laatste prijs
     last = float(ex.fetch_ticker(pair)["last"])
-    return last*(1-BAND_PCT), last*(1+BAND_PCT)
+    return last * (1 - BAND_PCT), last * (1 + BAND_PCT)
 
 def normalize_weights(pairs: List[str], weights_csv: str) -> Dict[str, float]:
-    if weights_csv:
-        parts = [x.strip() for x in weights_csv.split(",") if x.strip()]
-        d = {}
-        for p in parts:
-            k, v = p.split(":")
-            d[k.strip().upper()] = float(v)
-        s = sum(d.get(x, 0.0) for x in pairs)
-        if s > 0:
-            return {x: d.get(x, 0.0)/s for x in pairs}
+    chosen = {}
+    try:
+        for chunk in [x.strip() for x in weights_csv.split(",") if x.strip()]:
+            k, v = chunk.split(":")
+            chosen[k.strip().upper()] = float(v)
+    except Exception:
+        chosen = {}
+    total = sum(chosen.get(p, 0.0) for p in pairs)
+    if total > 0:
+        return {p: chosen.get(p, 0.0) / total for p in pairs}
     eq = 1.0 / len(pairs)
-    return {x: eq for x in pairs}
+    return {p: eq for p in pairs}
 
 def init_portfolio(pairs: List[str], weights: Dict[str, float]) -> dict:
-    port = {"portfolio_eur": CAPITAL_EUR, "coins": {}, "pnl_realized": 0.0}
-    for p in pairs:
-        port["coins"][p] = {"qty": 0.0, "cash_alloc": CAPITAL_EUR * weights[p]}
-    return port
+    portfolio = {
+        "EUR_cash": CAPITAL_EUR,
+        "coins": {p: {"qty": 0.0, "cash_alloc": CAPITAL_EUR * weights[p]} for p in pairs},
+        "pnl_realized": 0.0
+    }
+    return portfolio
 
 def mk_grid_state(ex, pair: str) -> dict:
     low, high = compute_band_from_history(ex, pair)
+    levels = geometric_levels(low, high, GRID_LEVELS)
     return {
-        "low": low, "high": high,
-        "levels": geometric_levels(low, high, GRID_LEVELS),
+        "low": low, "high": high, "levels": levels,
         "last_price": None,
-        "inventory_lots": [],  # [{qty, buy_price}]
+        "inventory_lots": []  # [{qty, buy_price}]
     }
 
 def mark_to_market(ex, state: dict, pairs: List[str]) -> float:
-    total = state["portfolio"]["portfolio_eur"]
+    total = state["portfolio"]["EUR_cash"]
     for p in pairs:
         qty = state["portfolio"]["coins"][p]["qty"]
         if qty > 0:
@@ -128,110 +156,133 @@ def mark_to_market(ex, state: dict, pairs: List[str]) -> float:
             total += qty * px
     return total
 
-def try_fill_grid(pair, price_now, price_prev, grid, port, ex) -> List[str]:
+# ====== Fillsimulator ======
+def try_fill_grid(pair: str, price_now: float, price_prev: float, grid: dict, port: dict, ex) -> List[str]:
     logs = []
     levels = grid["levels"]
-    cash_alloc = port["coins"][pair]["cash_alloc"]
-    order_eur = max(1.0, (cash_alloc * 0.90) / (len(levels)//2))
 
-    # BUY: down-cross
+    # Ordergrootte: verdeel ~90% van alloc over (levels/2) buys
+    alloc = port["coins"][pair]["cash_alloc"]
+    order_eur = max(1.0, (alloc * 0.90) / max(1, len(levels)//2))
+
+    # BUY: neerwaarts door level
     if price_prev is not None and price_now < price_prev:
         crossed = [L for L in levels if price_now <= L < price_prev]
         for L in crossed:
-            if port["portfolio_eur"] < order_eur*(1+FEE_PCT):
-                logs.append(f"[{pair}] BUY skip: onvoldoende EUR")
+            total_cost = order_eur * (1 + FEE_PCT)
+            if port["EUR_cash"] < total_cost:
+                logs.append(f"[{pair}] BUY skip (te weinig EUR) cash={port['EUR_cash']:.2f}")
                 continue
             qty = order_eur / L
             fee_eur = order_eur * FEE_PCT
-            port["portfolio_eur"] -= (order_eur + fee_eur)
+            port["EUR_cash"] -= (order_eur + fee_eur)
             port["coins"][pair]["qty"] += qty
             grid["inventory_lots"].append({"qty": qty, "buy_price": L})
-            append_csv(TRADES_CSV, [now_iso(), pair, "BUY", f"{L:.6f}", f"{qty:.8f}", f"{fee_eur:.2f}",
-                                    f"{port['portfolio_eur']:.2f}", pair.split("/")[0],
-                                    f"{port['coins'][pair]['qty']:.8f}", "0.00", "grid_buy"])
-            if LOG_TRADES:
-                log(f"{pair} BUY  qty={qty:.8f}  px=€{L:.6f}  fee=€{fee_eur:.2f}  EUR_cash={port['portfolio_eur']:.2f}")
 
-    # SELL: up-cross – pak eerste lot met winst
+            append_csv(
+                TRADES_CSV,
+                [now_iso(), pair, "BUY", f"{L:.6f}", f"{qty:.8f}", f"{fee_eur:.2f}",
+                 f"{port['EUR_cash']:.2f}", pair.split("/")[0], f"{port['coins'][pair]['qty']:.8f}", "0.00", "grid_buy"],
+                ["timestamp","pair","side","price","amount","fee_eur","eur_cash","asset","asset_qty","realized_pnl_eur","comment"]
+            )
+            logs.append(f"[{pair}] BUY {qty:.8f} @ €{L:.6f} | EUR_cash={port['EUR_cash']:.2f}")
+
+    # SELL: opwaarts door level, verkoop eerste lot met winst
     if price_prev is not None and price_now > price_prev and grid["inventory_lots"]:
         crossed = [L for L in levels if price_prev < L <= price_now]
         for L in crossed:
-            lot_idx = None
-            for i, lot in enumerate(grid["inventory_lots"]):
-                if L > lot["buy_price"]:
-                    lot_idx = i
-                    break
-            if lot_idx is None:
+            idx = next((i for i, lot in enumerate(grid["inventory_lots"]) if L > lot["buy_price"]), None)
+            if idx is None:
                 continue
-            lot = grid["inventory_lots"].pop(lot_idx)
+            lot = grid["inventory_lots"].pop(idx)
             qty = lot["qty"]
             proceeds = qty * L
             fee_eur = proceeds * FEE_PCT
             pnl = proceeds - fee_eur - (qty * lot["buy_price"])
-            port["portfolio_eur"] += (proceeds - fee_eur)
+
+            port["EUR_cash"] += (proceeds - fee_eur)
             port["coins"][pair]["qty"] -= qty
             port["pnl_realized"] += pnl
-            append_csv(TRADES_CSV, [now_iso(), pair, "SELL", f"{L:.6f}", f"{qty:.8f}", f"{fee_eur:.2f}",
-                                    f"{port['portfolio_eur']:.2f}", pair.split("/")[0],
-                                    f"{port['coins'][pair]['qty']:.8f}", f"{pnl:.2f}", "grid_sell"])
-            if LOG_TRADES:
-                log(f"{pair} SELL qty={qty:.8f}  px=€{L:.6f}  pnl=€{pnl:.2f}  EUR_cash={port['portfolio_eur']:.2f}")
+
+            append_csv(
+                TRADES_CSV,
+                [now_iso(), pair, "SELL", f"{L:.6f}", f"{qty:.8f}", f"{fee_eur:.2f}",
+                 f"{port['EUR_cash']:.2f}", pair.split("/")[0], f"{port['coins'][pair]['qty']:.8f}", f"{pnl:.2f}", "grid_sell"],
+                ["timestamp","pair","side","price","amount","fee_eur","eur_cash","asset","asset_qty","realized_pnl_eur","comment"]
+            )
+            logs.append(f"[{pair}] SELL {qty:.8f} @ €{L:.6f} | PnL={pnl:.2f} | EUR_cash={port['EUR_cash']:.2f}")
 
     grid["last_price"] = price_now
     return logs
 
+# ====== Main loop ======
 def main():
-    log(f"== PAPER GRID start | capital=€{CAPITAL_EUR:.2f} | levels={GRID_LEVELS} | fee={FEE_PCT*100:.3f}% ==")
+    print("======================================================")
+    print(" PAPER GRID BOT (paper) gestart")
+    print(f"  - Data directory   : {DATA_DIR.resolve()}")
+    print(f"  - State file       : {STATE_FILE.name}")
+    print(f"  - Trades csv       : {TRADES_CSV.name}")
+    print(f"  - Equity csv       : {EQUITY_CSV.name}")
+    print(f"  - Kapitaal         : €{CAPITAL_EUR:.2f}")
+    print(f"  - Grid levels      : {GRID_LEVELS}")
+    print(f"  - Fee              : {FEE_PCT*100:.3f}%")
+    print("======================================================")
+
     pairs = [x.strip().upper() for x in COINS_CSV.split(",") if x.strip()]
     ex = make_ex()
     pairs = [p for p in pairs if p in ex.markets]
     if not pairs:
-        raise SystemExit("Geen geldige markten gevonden.")
+        raise SystemExit("Geen geldige markten gevonden op exchange.")
 
-    # weights + state
     weights = normalize_weights(pairs, WEIGHTS_CSV)
+
     state = load_state() or {}
     if "portfolio" not in state:
         state["portfolio"] = init_portfolio(pairs, weights)
-    if "grids" not in state: state["grids"] = {}
+    if "grids" not in state:
+        state["grids"] = {}
     for p in pairs:
         if p not in state["grids"]:
             state["grids"][p] = mk_grid_state(ex, p)
+
     save_state(state)
 
-    last_equity_day = None
-    state["_last_summary_ts"] = 0.0
+    last_equity_day: str | None = None
+    last_summary_ts = 0.0
 
     while True:
         try:
-            today = datetime.now(timezone.utc).date().isoformat()
+            # Dagelijkse equity snapshot
+            today = date.today().isoformat()
             if today != last_equity_day:
-                equity = mark_to_market(ex, state, pairs)
-                append_csv(EQUITY_CSV, [today, f"{equity:.2f}"])
+                eq = mark_to_market(ex, state, pairs)
+                append_csv(EQUITY_CSV, [today, f"{eq:.2f}"], ["date","total_equity_eur"])
                 last_equity_day = today
 
+            # Per pair prijzen en fills
             for p in pairs:
                 px = float(ex.fetch_ticker(p)["last"])
                 grid = state["grids"][p]
-                try_fill_grid(p, px, grid["last_price"], grid, state["portfolio"], ex)
+                logs = try_fill_grid(p, px, grid["last_price"], grid, state["portfolio"], ex)
+                if logs:
+                    print("\n".join(logs))
 
-            if LOG_SUMMARY_SEC > 0:
-                now_ts = time.time()
-                if now_ts - state["_last_summary_ts"] >= LOG_SUMMARY_SEC:
-                    eq = mark_to_market(ex, state, pairs)
-                    eur = state["portfolio"]["portfolio_eur"]
-                    realized = state["portfolio"]["pnl_realized"]
-                    per = ", ".join(f"{p.split('/')[0]}:{state['portfolio']['coins'][p]['qty']:.6f}" for p in pairs)
-                    log(f"SUMMARY equity=€{eq:.2f} EUR_cash=€{eur:.2f} realized=€{realized:.2f} pos[{per}]")
-                    state["_last_summary_ts"] = now_ts
+            # periodieke console-samenvatting (±60s)
+            now = time.time()
+            if now - last_summary_ts > 60:
+                eq = mark_to_market(ex, state, pairs)
+                print(f"[SUMMARY {now_iso()}] cash=€{state['portfolio']['EUR_cash']:.2f} | realized=€{state['portfolio']['pnl_realized']:.2f} | equity=€{eq:.2f}")
+                last_summary_ts = now
 
             save_state(state)
             time.sleep(SLEEP_SEC)
 
         except ccxt.NetworkError as e:
-            log(f"[neterr] {e}; backoff.."); time.sleep(2 + random.random())
+            print(f"[neterr] {e}; retry...")
+            time.sleep(2 + random.random())
         except Exception as e:
-            log(f"[runtime] {e}"); time.sleep(5)
+            print(f"[runtime] {repr(e)}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
