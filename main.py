@@ -325,5 +325,7 @@ while True:
         print(f"[runtime] {e}")
         import traceback
 traceback.print_exc()
+    except Exception as e:
         botlog.exception("runtime: %s", e)
         time.sleep(5)
+
