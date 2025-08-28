@@ -1,91 +1,105 @@
-# ==============================
-#  gridbot main.py  (ETH/EUR)
-#  - Verkoopt nooit onder break-even + min_profit (incl. fees), behalve bij STOP_LOSS
-#  - Trailing take-profit
-#  - One-position-only + cooldowns
-#  - Bitvavo (ccxt) live-only
-# ==============================
+# main.py
+# --- Spot grid/signal bot (Bitvavo) met netto-winstbewaking ---
+# - Fees verdisconteerd: FEE_PCT per order (bv. 0.0015 = 0,15%).
+# - Verkoop alleen bij netto >= MIN_PROFIT_PCT of TAKE_PROFIT; STOP_LOSS als floor.
+# - Cooldowns om dubbele trades te voorkomen.
+# - ONE_POSITION_ONLY (optioneel).
+# - Respecteert min cost/amount van de beurs.
+# ---------------------------------------------------------------
 
-import os, time, csv, pathlib, logging, random, math
+import os, time, csv, pathlib, logging, random
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 import ccxt
 import pandas as pd
 
-# ---------- helpers ----------
+# ========== Helpers ==========
 def now_iso():
-    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(ZoneInfo("Europe/Amsterdam")).strftime("%Y-%m-%d %H:%M:%S")
 
-def _mask(s):
-    if not s: return "MISSING"
+def mask(s: str | None) -> str:
+    if not s:
+        return "MISSING"
+    if len(s) <= 8:
+        return s
     return s[:4] + "..." + s[-4:]
 
-# ---------- ENV (alfabetisch) ----------
+# ========== ENV ==========
 API_KEY  = os.getenv("API_KEY", "")
 API_SECRET = os.getenv("API_SECRET", "")
 
-BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "1.5"))
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "180"))
-EUR_PER_TRADE = float(os.getenv("EUR_PER_TRADE", "15"))
+SYMBOL = os.getenv("SYMBOL", "ETH/EUR")
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")
+
+# Signaal (MA cross)
 FAST = int(os.getenv("FAST", "3"))
-FEE_PCT = float(os.getenv("FEE_PCT", "0.0015"))  # 0.15%/order
-LIVE = os.getenv("LIVE", "true").lower() in ("1","true","yes","y")
-LOCK_PREEXISTING_BALANCE = os.getenv("LOCK_PREEXISTING_BALANCE", "false").lower() in ("1","true","yes","y")
-LOG_SUMMARY_SEC = int(os.getenv("LOG_SUMMARY_SEC", "600"))
-LOG_TRADES = os.getenv("LOG_TRADES", "true").lower() in ("1","true","yes","y")
-MAX_BUYS_PER_POSITION = int(os.getenv("MAX_BUYS_PER_POSITION", "1"))
-MAX_EUR_PER_TRADE = float(os.getenv("MAX_EUR_PER_TRADE", "20"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.005"))  # 0.5%
-ONE_POSITION_ONLY = os.getenv("ONE_POSITION_ONLY", "true").lower() in ("1","true","yes","y")
-OPERATOR_ID = os.getenv("OPERATOR_ID", "12234").strip()
-ORDER_ID_PREFIX = os.getenv("ORDER_ID_PREFIX", "gridbot")
-REQUEST_INTERVAL_SEC = float(os.getenv("REQUEST_INTERVAL_SEC", "1.0"))
-SLEEP_SEC = int(os.getenv("SLEEP_SEC", "60"))
 SLOW = int(os.getenv("SLOW", "6"))
-STOP_LOSS = float(os.getenv("STOP_LOSS", "0.02"))    # 2% max verlies
-SYMBOL = os.getenv("SYMBOL", "ETH/EUR").upper()
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.02"))  # vaste TP 2%
-TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "180"))
-TRAIL_GAP = float(os.getenv("TRAIL_GAP", "0.005"))     # 0.5% onder piek
-TRAIL_START = float(os.getenv("TRAIL_START", "0.015")) # start lock bij +1.5%
-TRAIL_TRIGGER = float(os.getenv("TRAIL_TRIGGER", "0.02"))  # activeer bij +2%
 
-if not LIVE:
-    raise SystemExit("Deze bot draait alleen LIVE. Zet LIVE=true.")
+# Live
+LIVE = os.getenv("LIVE", "true").lower() in ("1","true","yes")
 
-if not API_KEY or not API_SECRET:
-    raise SystemExit("GEEN API_SLEUTELS: zet API_KEY en API_SECRET in Secrets.")
+# Trade sizing
+EUR_PER_TRADE = float(os.getenv("EUR_PER_TRADE", "15"))
+MAX_EUR_PER_TRADE = float(os.getenv("MAX_EUR_PER_TRADE", "20"))
 
-# ---------- Logging ----------
-LOG_DIR = pathlib.Path(".")
-LOG_DIR.mkdir(exist_ok=True)
+# Fees & winst/risico
+FEE_PCT = float(os.getenv("FEE_PCT", "0.0015"))          # 0,15% per order
+MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.006"))  # 0,6% netto target
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.010"))        # 1,0% hard TP
+STOP_LOSS   = float(os.getenv("STOP_LOSS", "0.03"))           # 3% SL
 
-logger = logging.getLogger("gridbot")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    fh = RotatingFileHandler(LOG_DIR / "bot.log", maxBytes=512_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    logger.addHandler(fh)
+# Cooldowns
+TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "300"))  # 5 min
+SLEEP_SEC = float(os.getenv("SLEEP_SEC", "60"))
 
-TRADES_CSV = LOG_DIR / "trades.csv"
-def log_trade(ts, side, price, amount, reason, pnl_eur=0.0):
-    if not LOG_TRADES:
-        return
+# Veiligheid / gedrag
+ONE_POSITION_ONLY = os.getenv("ONE_POSITION_ONLY", "true").lower() in ("1","true","yes")
+LOCK_PREEXISTING_BALANCE = os.getenv("LOCK_PREEXISTING_BALANCE","false").lower() in ("1","true","yes")
+
+# Misc
+REQUEST_INTERVAL_SEC = float(os.getenv("REQUEST_INTERVAL_SEC","1.0"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES","5"))
+BACKOFF_BASE = float(os.getenv("BACKOFF_BASE","1.5"))
+
+ORDER_ID_PREFIX = os.getenv("ORDER_ID_PREFIX", "gridbot")
+OPERATOR_ID = os.getenv("OPERATOR_ID", "").strip()
+
+LOG_TRADES = os.getenv("LOG_TRADES","true").lower() in ("1","true","yes")
+LOG_SUMMARY_SEC = int(os.getenv("LOG_SUMMARY_SEC","600"))
+
+# ========== Logging ==========
+LOG_DIR = pathlib.Path("."); LOG_DIR.mkdir(exist_ok=True)
+botlog = logging.getLogger("bot"); botlog.setLevel(logging.INFO)
+if not botlog.handlers:
+    h = RotatingFileHandler(LOG_DIR/"bot.log", maxBytes=512_000, backupCount=3, encoding="utf-8")
+    h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    botlog.addHandler(h)
+
+TRADES_CSV = LOG_DIR/"trades.csv"
+def log_trade(ts, side, price, amount, reason, pnl_eur=""):
+    if not LOG_TRADES: return
     new = not TRADES_CSV.exists()
     with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if new:
             w.writerow(["timestamp","symbol","side","price","amount","reason","pnl_eur"])
-        w.writerow([ts, SYMBOL, side, f"{price:.8f}", f"{amount:.8f}", reason, f"{pnl_eur:.2f}"])
+        w.writerow([ts, SYMBOL, side, f"{price:.8f}", f"{amount:.8f}", reason, pnl_eur])
 
-# ---------- Exchange ----------
-ex = ccxt.bitvavo({
-    "apiKey": API_KEY,
-    "secret": API_SECRET,
-    "enableRateLimit": True,
-})
-ex.options["createMarketBuyOrderRequiresPrice"] = False  # Bitvavo buy via "cost"
+# ========== Checks ==========
+if not LIVE:
+    raise SystemExit("Deze bot is LIVE-only. Zet LIVE=true in je env.")
+if not API_KEY or not API_SECRET:
+    raise SystemExit("API_KEY en/of API_SECRET ontbreekt.")
+
+print(f"API_KEY={mask(API_KEY)} | API_SECRET={mask(API_SECRET)}")
+print(f"Start | {SYMBOL} | tf={TIMEFRAME} | €/trade={EUR_PER_TRADE} | fee={FEE_PCT*100:.2f}% "
+      f"| minProfit={MIN_PROFIT_PCT*100:.2f}% | TP={TAKE_PROFIT*100:.2f}% | SL={STOP_LOSS*100:.2f}%")
+
+# ========== Exchange ==========
+ex = ccxt.bitvavo({"apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True})
+ex.options["createMarketBuyOrderRequiresPrice"] = False
 
 markets = ex.load_markets()
 if SYMBOL not in markets:
@@ -93,17 +107,16 @@ if SYMBOL not in markets:
 
 BASE, QUOTE = SYMBOL.split("/")
 _limits = markets[SYMBOL].get("limits", {})
-MIN_BASE  = float((_limits.get("amount") or {}).get("min") or 0.0)
-MIN_QUOTE = float((_limits.get("cost")   or {}).get("min") or 0.0)
+MIN_BASE = float((_limits.get("amount") or {}).get("min") or 0.0)   # min in BASE
+MIN_QUOTE = float((_limits.get("cost") or {}).get("min") or 0.0)    # min in EUR
 
-def amount_to_precision(symbol, amount: float) -> float:
-    return float(ex.amount_to_precision(symbol, amount))
+def amount_to_precision(sym, amt): return float(ex.amount_to_precision(sym, amt))
 
-# ---------- retry / basic pacing ----------
 _last_call = 0.0
-def _respect_interval():
+def respect_interval():
     global _last_call
-    wait = REQUEST_INTERVAL_SEC - (time.time() - _last_call)
+    now = time.time()
+    wait = REQUEST_INTERVAL_SEC - (now - _last_call)
     if wait > 0: time.sleep(wait)
     _last_call = time.time()
 
@@ -111,97 +124,95 @@ def with_retry(fn, *a, **kw):
     delay = 1.0
     for i in range(1, MAX_RETRIES+1):
         try:
-            _respect_interval()
+            respect_interval()
             return fn(*a, **kw)
-        except (ccxt.NetworkError, ccxt.RateLimitExceeded, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:
-            sleep_s = delay + random.uniform(0, 0.5)
-            print(f"[retry {i}/{MAX_RETRIES}] {e} -> sleep {sleep_s:.2f}s")
-            logger.warning("retry %s/%s: %s", i, MAX_RETRIES, e)
-            time.sleep(sleep_s)
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:
+            botlog.warning("retry %s/%s: %s", i, MAX_RETRIES, e)
+            time.sleep(delay + random.random()*0.5)
             delay *= BACKOFF_BASE
         except Exception as e:
-            logger.exception("unexpected: %s", e)
+            botlog.exception("unexpected: %s", e)
             time.sleep(1.0)
-    raise RuntimeError("Max retries reached")
+    raise RuntimeError("Max retries reached.")
 
-# ---------- signaal ----------
-def fetch_df(limit=SLOW+5) -> pd.DataFrame:
-    o = with_retry(ex.fetch_ohlcv, SYMBOL, timeframe="1m", limit=limit)
-    return pd.DataFrame(o, columns=["t","o","h","l","c","v"])
+# ========== Data & signal ==========
+def fetch_df(limit=SLOW+3) -> pd.DataFrame:
+    ohlcv = with_retry(ex.fetch_ohlcv, SYMBOL, timeframe=TIMEFRAME, limit=limit)
+    return pd.DataFrame(ohlcv, columns=["t","o","h","l","c","v"])
 
 def signal(df: pd.DataFrame) -> str:
-    if len(df) < max(FAST, SLOW)+3: return "HOLD"
+    if len(df) < max(FAST,SLOW) + 2: return "HOLD"
     f = df["c"].rolling(FAST).mean()
     s = df["c"].rolling(SLOW).mean()
-    # gebruik de voorlaatste candle voor cross
-    if f.iloc[-2] > s.iloc[-2] and f.iloc[-3] <= s.iloc[-3]:
-        return "BUY"
-    if f.iloc[-2] < s.iloc[-2] and f.iloc[-3] >= s.iloc[-3]:
-        return "SELL"
+    # cross op slot-1 (stabieler dan slot0)
+    if f.iloc[-2] > s.iloc[-2] and f.iloc[-3] <= s.iloc[-3]: return "BUY"
+    if f.iloc[-2] < s.iloc[-2] and f.iloc[-3] >= s.iloc[-3]: return "SELL"
     return "HOLD"
 
-# ---------- balans lock ----------
+# ========== State ==========
+entry_price: float | None = None
+position_amt: float = 0.0     # in BASE
+last_trade_ts = 0.0           # cooldown
+
+# (optioneel) startbalans lock
 start_bal = with_retry(ex.fetch_balance).get("free", {})
 start_eur  = float(start_bal.get(QUOTE, 0) or 0)
 start_base = float(start_bal.get(BASE, 0)  or 0)
 
-def bot_balances():
+def eur_for_bot():
     bal = with_retry(ex.fetch_balance).get("free", {})
-    eur  = float(bal.get(QUOTE, 0) or 0)
+    eur = float(bal.get(QUOTE, 0) or 0)
+    if LOCK_PREEXISTING_BALANCE:
+        return max(0.0, eur - start_eur)
+    return eur
+
+def base_for_bot():
+    bal = with_retry(ex.fetch_balance).get("free", {})
     base = float(bal.get(BASE, 0) or 0)
     if LOCK_PREEXISTING_BALANCE:
-        eur_for_bot  = max(0.0, eur - start_eur)
-        base_for_bot = max(0.0, base - start_base)
-    else:
-        eur_for_bot, base_for_bot = eur, base
-    return eur_for_bot, base_for_bot
+        return max(0.0, base - start_base)
+    return base
 
-# ---------- positie / trailing state ----------
-entry_price = None
-position_amt = 0.0
-buys_this_position = 0
+# ========== Netto PnL helper ==========
+def net_change_pct(cur_px: float, entry: float, fee_pct: float) -> float:
+    """
+    Benadering van netto % na round-trip fees (2x). 
+    (= (cur/entry - 1) - 2*fee_pct)
+    """
+    if not entry or entry <= 0: return 0.0
+    gross = (cur_px - entry) / entry
+    net = gross - 2*fee_pct
+    return net
 
-trail_active = False
-trail_peak = None
-trail_floor = None
-
-def reset_trailing():
-    global trail_active, trail_peak, trail_floor
-    trail_active = False
-    trail_peak = None
-    trail_floor = None
-
-last_trade_ts = 0.0
-last_summary_ts = 0.0
-
-# ---------- prijsdrempels ----------
-def break_even_sell_price(entry: float) -> float:
-    # koop-fee + verkoop-fee + minimaal gewenste winst
-    # (1 + FEE + MIN_PROFIT + FEE) = 1 + 2*FEE + MIN_PROFIT
-    return entry * (1.0 + (2.0 * FEE_PCT) + MIN_PROFIT_PCT)
-
-def fixed_take_profit(entry: float) -> float:
-    return entry * (1.0 + TAKE_PROFIT)
-
-def stop_loss_price(entry: float) -> float:
-    return entry * (1.0 - STOP_LOSS)
-
-# ---------- orders ----------
-def place_market_buy(eur_spend, px_now):
-    params = {"cost": eur_spend}
+# ========== Trading helpers ==========
+def market_buy_eur(spend_eur: float, px: float):
+    spend_eur = float(f"{spend_eur:.2f}")  # Bitvavo cost in 2 dec
+    if spend_eur < max(MIN_QUOTE, 0.50):
+        print(f"[BUY] overslaan: bedrag te klein (min €{max(MIN_QUOTE,0.50):.2f}).")
+        return 0.0
+    params = {"cost": spend_eur}
     if OPERATOR_ID: params["operatorId"] = OPERATOR_ID
-    with_retry(ex.create_order, SYMBOL, "market", "buy", None, None, params)
-    logger.info("BUY ~€%.2f @ €%.6f", eur_spend, px_now)
+    order = with_retry(ex.create_order, SYMBOL, "market", "buy", None, None, params)
+    filled = None
+    try:
+        filled = float(order.get("info", {}).get("filledAmount"))
+    except Exception: pass
+    if not filled:
+        filled = spend_eur / px
+    return filled
 
-def place_market_sell(amount, px_now):
+def market_sell_amount(qty: float, px: float):
+    qty = amount_to_precision(SYMBOL, qty)
+    if qty < MIN_BASE or (qty * px) < max(MIN_QUOTE, 0.50):
+        print(f"[SELL] overslaan: hoeveelheid te klein (min {MIN_BASE} {BASE}, €{max(MIN_QUOTE,0.50):.2f}).")
+        return 0.0
     params = {}
     if OPERATOR_ID: params["operatorId"] = OPERATOR_ID
-    with_retry(ex.create_order, SYMBOL, "market", "sell", amount, None, params)
-    logger.info("SELL %.8f @ €%.6f", amount, px_now)
+    with_retry(ex.create_order, SYMBOL, "market", "sell", qty, None, params)
+    return qty
 
-# ---------- main ----------
-print(f"START gridbot | {SYMBOL} | LIVE={LIVE} | €/trade={EUR_PER_TRADE} | fee={FEE_PCT*100:.3f}%")
-logger.info("START symbol=%s live=%s eur_per_trade=%.2f", SYMBOL, LIVE, EUR_PER_TRADE)
+# ========== Hoofdloop ==========
+last_summary = 0.0
 
 while True:
     try:
@@ -209,128 +220,108 @@ while True:
         px = float(df["c"].iloc[-1])
         sig = signal(df)
 
-        eur_free, base_free = bot_balances()
+        # Logs (samenvatting)
+        now = time.time()
+        if now - last_summary >= LOG_SUMMARY_SEC:
+            print(f"[SUMMARY] prijs=€{px:.3f} | pos={position_amt:.6f} {BASE} | entry={entry_price or 0:.4f} | vrij €={eur_for_bot():.2f}")
+            last_summary = now
 
-        # periodic summary
-        if time.time() - last_summary_ts >= LOG_SUMMARY_SEC:
-            print(f"[SUMMARY] cash=€{eur_free:.2f} pos={position_amt:.6f} {BASE} entry={entry_price if entry_price else 0:.4f}")
-            last_summary_ts = time.time()
-
-        # ----- trailing / SL / TP voor bestaande positie -----
+        # Exit-condities (als we een positie hebben)
         if position_amt > 0 and entry_price:
-            chg = (px - entry_price) / entry_price
+            net = net_change_pct(px, entry_price, FEE_PCT)
 
-            # trailing activeren bij trigger
-            if not trail_active and chg >= TRAIL_TRIGGER:
-                trail_active = True
-                trail_peak = px
-                trail_floor = max(entry_price * (1.0 + TRAIL_START), trail_peak * (1.0 - TRAIL_GAP))
-                print(f"[TRAIL] Activated peak=€{trail_peak:.6f} floor=€{trail_floor:.6f}")
-
-            if trail_active:
-                if px > trail_peak:
-                    trail_peak = px
-                    trail_floor = trail_peak * (1.0 - TRAIL_GAP)
-                elif px <= trail_floor:
-                    # trailing sell – check min-amount / min-cost
-                    to_sell = min(position_amt, base_free)
-                    to_sell = amount_to_precision(SYMBOL, to_sell)
-                    if to_sell >= MIN_BASE and to_sell*px >= max(MIN_QUOTE, 0.50):
-                        place_market_sell(to_sell, px)
-                        pnl = (px - entry_price) * to_sell - (px*to_sell*FEE_PCT) - (entry_price*to_sell*FEE_PCT)
-                        log_trade(now_iso(), "SELL", px, to_sell, "TRAIL", pnl)
-                        position_amt -= to_sell
-                        if position_amt <= 1e-9:
-                            position_amt = 0.0
-                            entry_price = None
-                            buys_this_position = 0
-                            reset_trailing()
-                        last_trade_ts = time.time()
-                        time.sleep(SLEEP_SEC)
-                        continue
-
-            # vaste TP of SL
-            if px >= fixed_take_profit(entry_price) or px <= stop_loss_price(entry_price):
-                reason = "TAKE_PROFIT" if px >= fixed_take_profit(entry_price) else "STOP_LOSS"
-                to_sell = min(position_amt, base_free)
-                to_sell = amount_to_precision(SYMBOL, to_sell)
-                if to_sell >= MIN_BASE and to_sell*px >= max(MIN_QUOTE, 0.50):
-                    place_market_sell(to_sell, px)
-                    pnl = (px - entry_price) * to_sell - (px*to_sell*FEE_PCT) - (entry_price*to_sell*FEE_PCT)
-                    log_trade(now_iso(), "SELL", px, to_sell, reason, pnl)
-                    position_amt -= to_sell
-                    if position_amt <= 1e-9:
+            if net >= TAKE_PROFIT or net >= MIN_PROFIT_PCT:
+                # winst nemen
+                qty = min(position_amt, base_for_bot())
+                sold = market_sell_amount(qty, px)
+                if sold > 0:
+                    pnl_eur = sold * (px - entry_price) - (sold*px + sold*entry_price) * FEE_PCT
+                    print(f"[LIVE] TAKE/PROFIT SELL {sold:.6f} {BASE} @ €{px:.4f} | net={net*100:.2f}% | pnl≈€{pnl_eur:.2f}")
+                    botlog.info("SELL TP | px=%.6f net=%.4f", px, net)
+                    log_trade(now_iso(), "SELL", px, sold, "TAKE_PROFIT", f"{pnl_eur:.2f}")
+                    position_amt -= sold
+                    if position_amt <= 1e-8:
                         position_amt = 0.0
                         entry_price = None
-                        buys_this_position = 0
-                        reset_trailing()
                     last_trade_ts = time.time()
-                    time.sleep(SLEEP_SEC)
-                    continue
+                    time.sleep(SLEEP_SEC); continue
 
-        # ----- BUY -----
+            if net <= -STOP_LOSS:
+                qty = min(position_amt, base_for_bot())
+                sold = market_sell_amount(qty, px)
+                if sold > 0:
+                    pnl_eur = sold * (px - entry_price) - (sold*px + sold*entry_price) * FEE_PCT
+                    print(f"[LIVE] STOP/LOSS SELL {sold:.6f} {BASE} @ €{px:.4f} | net={net*100:.2f}% | pnl≈€{pnl_eur:.2f}")
+                    botlog.info("SELL SL | px=%.6f net=%.4f", px, net)
+                    log_trade(now_iso(), "SELL", px, sold, "STOP_LOSS", f"{pnl_eur:.2f}")
+                    position_amt -= sold
+                    if position_amt <= 1e-8:
+                        position_amt = 0.0
+                        entry_price = None
+                    last_trade_ts = time.time()
+                    time.sleep(SLEEP_SEC); continue
+
+        # Buy-condities
         if sig == "BUY":
-            # cooldown & one-position rules
-            if time.time() - last_trade_ts < COOLDOWN_SEC:
+            # cooldown
+            if time.time() - last_trade_ts < TRADE_COOLDOWN_SEC:
                 pass
-            elif ONE_POSITION_ONLY and position_amt > 0 and buys_this_position >= MAX_BUYS_PER_POSITION:
+            elif ONE_POSITION_ONLY and position_amt > 0:
                 pass
             else:
-                eur_room = eur_free
-                if eur_room > 0:
-                    target = min(EUR_PER_TRADE, MAX_EUR_PER_TRADE, eur_room)
-                    # respecteer minimumeisen
-                    need_eur = max(MIN_QUOTE, (MIN_BASE * px))
-                    if target + 1e-9 < need_eur:
-                        # probeer naar boven bij te stellen binnen je cap/room
-                        target = min(max(target, need_eur), eur_room, MAX_EUR_PER_TRADE)
-                    spend = math.floor(target*100)/100  # 2 decimalen EUR
-                    est_base = spend / px
-                    if spend >= max(MIN_QUOTE, 0.5) and est_base >= MIN_BASE:
-                        place_market_buy(spend, px)
-                        # conservatief: neem gevulde qty ≈ spend/px
-                        got = est_base
-                        position_amt += got
-                        # gemiddelde entry als er al iets ligt
-                        if entry_price:
-                            entry_price = ((entry_price * (position_amt-got)) + (px * got)) / position_amt
-                        else:
-                            entry_price = px
-                        buys_this_position += 1
-                        log_trade(now_iso(), "BUY", px, got, "SIGNAL")
-                        reset_trailing()
-                        last_trade_ts = time.time()
+                room = eur_for_bot()
+                if room <= 0.5:
+                    print("[LIVE] Geen vrij EUR.")
+                else:
+                    # Clamp t.o.v. minima
+                    target = min(EUR_PER_TRADE, MAX_EUR_PER_TRADE, room)
+                    # indien onder min cost -> opschalen naar min
+                    min_needed = max(MIN_QUOTE, 0.50)
+                    if target < min_needed:
+                        target = min(min_needed, room, MAX_EUR_PER_TRADE)
+                        if target < min_needed:
+                            print(f"[LIVE] BUY overslaan: min kost €{min_needed:.2f}.")
+                            time.sleep(SLEEP_SEC); continue
 
-        # ----- SELL (signaal) -> alleen als winst-drempel gehaald -----
-        elif sig == "SELL" and position_amt > 1e-9 and entry_price:
-            # alleen verkopen als prijs boven break-even + min_profit (inclusief fees)
-            sell_ok_price = max(break_even_sell_price(entry_price), fixed_take_profit(entry_price)*0.9999)
-            if px >= sell_ok_price or px <= stop_loss_price(entry_price):
-                to_sell = min(position_amt, base_free)
-                to_sell = amount_to_precision(SYMBOL, to_sell)
-                if to_sell >= MIN_BASE and to_sell*px >= max(MIN_QUOTE, 0.50):
-                    place_market_sell(to_sell, px)
-                    pnl = (px - entry_price) * to_sell - (px*to_sell*FEE_PCT) - (entry_price*to_sell*FEE_PCT)
-                    reason = "SIGNAL"
-                    if px <= stop_loss_price(entry_price):
-                        reason = "STOP_LOSS"
-                    log_trade(now_iso(), "SELL", px, to_sell, reason, pnl)
-                    position_amt -= to_sell
-                    if position_amt <= 1e-9:
+                    filled = market_buy_eur(target, px)
+                    if filled > 0:
+                        # gewogen gemiddelde entry
+                        if position_amt <= 0:
+                            entry_price = px
+                        else:
+                            # gemiddelde op basis van hoeveelheid
+                            entry_price = (entry_price*position_amt + px*filled) / (position_amt + filled)
+                        position_amt += filled
+                        last_trade_ts = time.time()
+                        print(f"[LIVE] BUY ~€{target:.2f} -> {filled:.6f} {BASE} @ €{px:.4f} | pos={position_amt:.6f} | entry=€{entry_price:.4f}")
+                        botlog.info("BUY cost=%.2f px=%.6f filled=%.8f", target, px, filled)
+                        log_trade(now_iso(), "BUY", px, filled, "SIGNAL_BUY")
+                        time.sleep(SLEEP_SEC); continue
+
+        # Eventuele SELL-signal (MA-downcross) als je dat graag wilt forceren:
+        # Alleen uitvoeren als netto winst voldoet, anders HOLD.
+        if sig == "SELL" and position_amt > 0 and entry_price:
+            net = net_change_pct(px, entry_price, FEE_PCT)
+            if net >= MIN_PROFIT_PCT:
+                qty = min(position_amt, base_for_bot())
+                sold = market_sell_amount(qty, px)
+                if sold > 0:
+                    pnl_eur = sold * (px - entry_price) - (sold*px + sold*entry_price) * FEE_PCT
+                    print(f"[LIVE] SIGNAL SELL {sold:.6f} {BASE} @ €{px:.4f} | net={net*100:.2f}% | pnl≈€{pnl_eur:.2f}")
+                    botlog.info("SELL SIGNAL | px=%.6f net=%.4f", px, net)
+                    log_trade(now_iso(), "SELL", px, sold, "SIGNAL_SELL", f"{pnl_eur:.2f}")
+                    position_amt -= sold
+                    if position_amt <= 1e-8:
                         position_amt = 0.0
                         entry_price = None
-                        buys_this_position = 0
-                        reset_trailing()
                     last_trade_ts = time.time()
 
         time.sleep(SLEEP_SEC)
 
     except KeyboardInterrupt:
-        print("Gestopt door gebruiker.")
-        logger.info("STOP by user")
+        print("Gestopt.")
         break
     except Exception as e:
-        print("[runtime] error:", e)
-        logger.exception("runtime error: %s", e)
+        print(f"[runtime] {e}")
+        botlog.exception("runtime: %s", e)
         time.sleep(5)
-
