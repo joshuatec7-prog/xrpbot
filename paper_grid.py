@@ -1,42 +1,23 @@
-# paper_grid.py
-# ------------------------------------------------------------
-# 24/7 PAPER GRID BOT (paper trading, publiekemarktdata via ccxt)
-# - Persistente bestanden in /data (als aanwezig) anders projectmap
-# - Grid per pair op basis van P10–P90 (30d 1h); fallback: ±BAND_PCT
-# - Virtuele fills (paper), fees, PnL, state.json voor recover
-# - trades.csv (alle fills) en equity.csv (dagelijks MTM-totaal)
-# ------------------------------------------------------------
-
-import os, json, time, math, csv, random
-from datetime import datetime, timezone, date
+# ------------------ Opslagpad (persistente disk) ------------------
+# Gebruik /var/data als mountpad op Render. Je mag dit desgewenst via een
+# ENV override nog aanpassen (DATA_DIR), maar standaard is het /var/data.
 from pathlib import Path
-from typing import Dict, List, Tuple
-
+import os, json, time, math, csv, random, statistics
+from datetime import datetime, timezone
 import ccxt
 import pandas as pd
 
-# ====== Helper: pad naar persistente data ======
-def resolve_data_dir() -> Path:
-    candidates = [
-        Path(os.getenv("DATA_DIR", "")),                 # expliciete override
-        Path("/opt/render/project/src/data"),           # aanbevolen Render pad
-        Path("/data"),                                  # alternatieve mount
-        Path(".")                                       # fallback
-    ]
-    for p in candidates:
-        if p and str(p) != "" and (p == Path(".") or p.exists()):
-            try:
-                p.mkdir(parents=True, exist_ok=True)
-                return p
-            except Exception:
-                continue
-    return Path(".")
+DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DATA_DIR: Path = resolve_data_dir()
+# Eventueel in submap bewaren zodat het netjes gescheiden is
+WORK_DIR   = DATA_DIR / "paper_grid"
+WORK_DIR.mkdir(exist_ok=True)
 
-STATE_FILE  = DATA_DIR / "state.json"
-TRADES_CSV  = DATA_DIR / "trades.csv"
-EQUITY_CSV  = DATA_DIR / "equity.csv"
+STATE_FILE = WORK_DIR / "state.json"
+TRADES_CSV = WORK_DIR / "trades.csv"
+EQUITY_CSV = WORK_DIR / "equity.csv"
+
 
 # ====== Config via ENV ======
 def _f(env: str, default: str) -> float:
