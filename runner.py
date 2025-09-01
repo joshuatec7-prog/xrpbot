@@ -2,8 +2,13 @@
 # Start paper_grid.py en draai elke 12 uur report_paper.py
 import subprocess, time, os, sys
 
-REPORT_EVERY_HOURS = float(os.getenv("REPORT_EVERY_HOURS", "12"))
-SLEEP_HEARTBEAT_SEC = 300  # kleine heartbeat, geen extra logging
+# runner.py – simpele orchestrator
+
+import subprocess, time, os, sys
+
+REPORT_EVERY_HOURS = 6          # <-- van 12 naar 6 uur
+SLEEP_HEARTBEAT_SEC = 300       # <-- 5 minuten (300 sec)
+
 
 def start_grid():
     # -u voor onbuffered logs
