@@ -3,7 +3,7 @@
 import subprocess, time, os, sys
 
 REPORT_EVERY_HOURS = float(os.getenv("REPORT_EVERY_HOURS", "12"))
-SLEEP_HEARTBEAT_SEC = 30  # kleine heartbeat, geen extra logging
+SLEEP_HEARTBEAT_SEC = 300  # kleine heartbeat, geen extra logging
 
 def start_grid():
     # -u voor onbuffered logs
