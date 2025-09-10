@@ -1,10 +1,11 @@
-# paper_grid.py — Multi-coin Paper Grid Bot (met live pnl_realized in SUMMARY)
+# paper_grid.py — Multi-coin Paper Grid Bot met dagelijkse PnL logging
 # - COINS & WEIGHTS uit ENV
 # - Gridband via 30d/1h P10–P90 (fallback median ± BAND_PCT)
 # - Virtuele fills: BUY/SELL (paper), fees & realized PnL
-# - Persistente state + trades.csv + equity.csv (in DATA_DIR)
+# - Persistente state + trades.csv + equity.csv + daily_pnl.csv (in DATA_DIR)
 # - ORDER_SIZE_FACTOR bepaalt ticketgrootte
 # - RESET_STATE/WARM_START worden gerespecteerd
+# - SUMMARY toont ook cum_pnl t.o.v. startkapitaal (CAPITAL_EUR)
 
 import os, json, time, csv, random
 from datetime import datetime, timezone
@@ -37,15 +38,16 @@ MIN_CASH_BUFFER_EUR   = float(os.getenv("MIN_CASH_BUFFER_EUR", "25"))
 MIN_TRADE_EUR         = float(os.getenv("MIN_TRADE_EUR", "5"))
 LOG_SUMMARY_SEC       = int(os.getenv("LOG_SUMMARY_SEC", "600"))
 
-# extra flags (mag blijven staan in je Render env)
+# extra flags
 RESET_STATE = os.getenv("RESET_STATE", "false").lower() in ("1", "true", "yes")
 WARM_START  = os.getenv("WARM_START",  "true").lower() in ("1", "true", "yes")
 
 # ------------------ Bestandslocaties ------------------
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE  = DATA_DIR / "state.json"
-TRADES_CSV  = DATA_DIR / "trades.csv"
-EQUITY_CSV  = DATA_DIR / "equity.csv"
+STATE_FILE      = DATA_DIR / "state.json"
+TRADES_CSV      = DATA_DIR / "trades.csv"
+EQUITY_CSV      = DATA_DIR / "equity.csv"
+DAILY_PNL_CSV   = DATA_DIR / "daily_pnl.csv"   # <— NIEUW
 
 # ------------------ Helpers ------------------
 def now_iso() -> str:
@@ -63,7 +65,22 @@ def append_csv(path: Path, row: List):
                 ])
             elif path == EQUITY_CSV:
                 w.writerow(["date","total_equity_eur"])
+            elif path == DAILY_PNL_CSV:
+                w.writerow(["date","equity_eur","realized_pnl_eur","day_pnl_eur","cum_pnl_eur"])
         w.writerow(row)
+
+def read_last_row(path: Path):
+    """Lees laatste rij uit een CSV-bestand (of None)."""
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            last = None
+            for row in csv.reader(f):
+                last = row
+            return last
+    except Exception:
+        return None
 
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -182,7 +199,6 @@ def try_fill_grid(pair: str, price_now: float, price_prev: float,
     if price_prev is not None and price_now < price_prev:
         crossed = [L for L in levels if price_now <= L < price_prev]
         for L in crossed:
-            # buffer & minimum
             fee_eur = order_eur * FEE_PCT
             if port["portfolio_eur"] - MIN_CASH_BUFFER_EUR < (order_eur + fee_eur):
                 logs.append(f"[{pair}] BUY skip: onvoldoende EUR (buffer).")
@@ -223,10 +239,9 @@ def try_fill_grid(pair: str, price_now: float, price_prev: float,
             fee_eur = proceeds * FEE_PCT
             pnl = proceeds - fee_eur - (qty * lot["buy_price"])
 
-            # >>> HIER: realized PnL direct optellen
             port["portfolio_eur"] += (proceeds - fee_eur)
             port["coins"][pair]["qty"] -= qty
-            port["pnl_realized"] += pnl  # <— TELLEN!
+            port["pnl_realized"] += pnl
 
             append_csv(TRADES_CSV, [
                 now_iso(), pair, "SELL", f"{L:.6f}", f"{qty:.8f}",
@@ -256,7 +271,6 @@ def main():
 
     state = {}
     if RESET_STATE and not WARM_START:
-        # geforceerd vers
         state = {}
         try:
             STATE_FILE.unlink(missing_ok=True)
@@ -281,11 +295,19 @@ def main():
 
     while True:
         try:
-            # Dagelijkse equity snapshot
+            # Dagelijks: equity snapshot + daily PnL regel
             today = datetime.now(timezone.utc).date().isoformat()
             if today != last_equity_day:
                 equity = mark_to_market(ex, state, pairs)
                 append_csv(EQUITY_CSV, [today, f"{equity:.2f}"])
+
+                last_daily = read_last_row(DAILY_PNL_CSV)  # [date,equity,realized,day,cum]
+                prev_equity = float(last_daily[1]) if last_daily and len(last_daily) >= 2 else CAPITAL_EUR
+                realized = float(state["portfolio"]["pnl_realized"])
+                day_pnl  = equity - prev_equity
+                cum_pnl  = equity - CAPITAL_EUR
+                append_csv(DAILY_PNL_CSV, [today, f"{equity:.2f}", f"{realized:.2f}", f"{day_pnl:.2f}", f"{cum_pnl:.2f}"])
+
                 last_equity_day = today
 
             # Per pair prijs ophalen en fills simuleren
@@ -297,13 +319,14 @@ def main():
                 if logs:
                     print("\n".join(logs))
 
-            # Periodieke samenvatting (inclusief live pnl_realized)
+            # Periodieke samenvatting
             now = time.time()
             if now - last_sum >= LOG_SUMMARY_SEC:
-                eq = mark_to_market(ex, state, pairs)
+                eq   = mark_to_market(ex, state, pairs)
                 cash = state["portfolio"]["portfolio_eur"]
-                pr = state["portfolio"]["pnl_realized"]
-                print(f"[SUMMARY] equity=€{eq:.2f} | cash=€{cash:.2f} | pnl_realized=€{pr:.2f}")
+                pr   = state["portfolio"]["pnl_realized"]
+                cum  = eq - CAPITAL_EUR
+                print(f"[SUMMARY] equity=€{eq:.2f} | cash=€{cash:.2f} | pnl_realized=€{pr:.2f} | cum_pnl=€{cum:.2f}")
                 last_sum = now
 
             save_state(state)
