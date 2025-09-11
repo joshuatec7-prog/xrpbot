@@ -1,11 +1,11 @@
-# paper_grid.py — Multi-coin Paper Grid Bot met dagelijkse PnL logging
+# paper_grid.py — Multi-coin Paper Grid Bot met "profit skim"
 # - COINS & WEIGHTS uit ENV
 # - Gridband via 30d/1h P10–P90 (fallback median ± BAND_PCT)
 # - Virtuele fills: BUY/SELL (paper), fees & realized PnL
-# - Persistente state + trades.csv + equity.csv + daily_pnl.csv (in DATA_DIR)
+# - Persistente state + trades.csv + equity.csv (in DATA_DIR)
 # - ORDER_SIZE_FACTOR bepaalt ticketgrootte
 # - RESET_STATE/WARM_START worden gerespecteerd
-# - SUMMARY toont ook cum_pnl t.o.v. startkapitaal (CAPITAL_EUR)
+# - NIEUW: houdt trading-equity rond CAPITAL_EUR en roomt overtollige cash af naar profit-pot
 
 import os, json, time, csv, random
 from datetime import datetime, timezone
@@ -16,7 +16,7 @@ import ccxt
 import pandas as pd
 
 # ------------------ ENV / Defaults ------------------
-CAPITAL_EUR = float(os.getenv("CAPITAL_EUR", "15000"))
+CAPITAL_EUR = float(os.getenv("CAPITAL_EUR", "50000"))
 
 COINS_CSV = os.getenv(
     "COINS", "BTC/EUR,ETH/EUR,SOL/EUR,XRP/EUR,LTC/EUR"
@@ -33,21 +33,25 @@ SLEEP_SEC   = float(os.getenv("SLEEP_SEC", "30"))
 EXCHANGE_ID = os.getenv("EXCHANGE", "bitvavo")
 DATA_DIR    = Path(os.getenv("DATA_DIR", "/var/data"))
 
-ORDER_SIZE_FACTOR     = float(os.getenv("ORDER_SIZE_FACTOR", "2.0"))
-MIN_CASH_BUFFER_EUR   = float(os.getenv("MIN_CASH_BUFFER_EUR", "25"))
+ORDER_SIZE_FACTOR     = float(os.getenv("ORDER_SIZE_FACTOR", "1.0"))
+MIN_CASH_BUFFER_EUR   = float(os.getenv("MIN_CASH_BUFFER_EUR", "250"))
 MIN_TRADE_EUR         = float(os.getenv("MIN_TRADE_EUR", "5"))
 LOG_SUMMARY_SEC       = int(os.getenv("LOG_SUMMARY_SEC", "600"))
 
-# extra flags
+# extra flags (mag blijven staan in je Render env)
 RESET_STATE = os.getenv("RESET_STATE", "false").lower() in ("1", "true", "yes")
 WARM_START  = os.getenv("WARM_START",  "true").lower() in ("1", "true", "yes")
 
+# NIEUW: winst-afromen
+SKIM_PROFITS       = os.getenv("SKIM_PROFITS", "true").lower() in ("1","true","yes")
+SKIM_INTERVAL_MIN  = int(os.getenv("SKIM_INTERVAL_MIN", "10"))
+SKIM_MIN_EUR       = float(os.getenv("SKIM_MIN_EUR", "50"))
+
 # ------------------ Bestandslocaties ------------------
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE      = DATA_DIR / "state.json"
-TRADES_CSV      = DATA_DIR / "trades.csv"
-EQUITY_CSV      = DATA_DIR / "equity.csv"
-DAILY_PNL_CSV   = DATA_DIR / "daily_pnl.csv"   # <— NIEUW
+STATE_FILE  = DATA_DIR / "state.json"
+TRADES_CSV  = DATA_DIR / "trades.csv"
+EQUITY_CSV  = DATA_DIR / "equity.csv"
 
 # ------------------ Helpers ------------------
 def now_iso() -> str:
@@ -65,22 +69,7 @@ def append_csv(path: Path, row: List):
                 ])
             elif path == EQUITY_CSV:
                 w.writerow(["date","total_equity_eur"])
-            elif path == DAILY_PNL_CSV:
-                w.writerow(["date","equity_eur","realized_pnl_eur","day_pnl_eur","cum_pnl_eur"])
         w.writerow(row)
-
-def read_last_row(path: Path):
-    """Lees laatste rij uit een CSV-bestand (of None)."""
-    if not path.exists():
-        return None
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            last = None
-            for row in csv.reader(f):
-                last = row
-            return last
-    except Exception:
-        return None
 
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -159,15 +148,16 @@ def mk_grid_state(ex, pair: str, levels: int) -> dict:
 # ------------------ Portfolio & waardering ------------------
 def init_portfolio(pairs: List[str], weights: Dict[str, float]) -> dict:
     return {
-        "portfolio_eur": CAPITAL_EUR,    # centrale EUR pot
-        "pnl_realized": 0.0,             # loopt mee bij elke SELL
+        "portfolio_eur": CAPITAL_EUR,    # trading cash (rond 50k houden)
+        "pnl_realized": 0.0,             # realized PnL van grid Sells
+        "profit_eur": 0.0,               # AFGEROOMDE winst (niet meer mee-traden)
         "coins": {
             p: {"qty": 0.0, "cash_alloc": CAPITAL_EUR * weights[p]} for p in pairs
         }
     }
 
 def mark_to_market(ex, state: dict, pairs: List[str]) -> float:
-    """Equity = cash + marktwaarde holdings (pnl_realized zit al impliciet in cash)."""
+    """Trading equity = trading cash + marktwaarde holdings (ZONDER profit-pot)."""
     total = state["portfolio"]["portfolio_eur"]
     for p in pairs:
         qty = state["portfolio"]["coins"][p]["qty"]
@@ -224,7 +214,6 @@ def try_fill_grid(pair: str, price_now: float, price_prev: float,
     if price_prev is not None and price_now > price_prev and grid["inventory_lots"]:
         crossed = [L for L in levels if price_prev < L <= price_now]
         for L in crossed:
-            # pak een winnende lot
             lot_idx = None
             for i, lot in enumerate(grid["inventory_lots"]):
                 if L > lot["buy_price"]:
@@ -254,6 +243,38 @@ def try_fill_grid(pair: str, price_now: float, price_prev: float,
     grid["last_price"] = price_now
     return logs
 
+# ------------------ Winst afromen ------------------
+def skim_profits_if_needed(ex, state: dict, pairs: List[str], last_skim_ts: list):
+    """Houd trading-equity ~ CAPITAL_EUR. Room overtollige cash af naar profit_eur."""
+    if not SKIM_PROFITS:
+        return
+
+    now = time.time()
+    if now - last_skim_ts[0] < SKIM_INTERVAL_MIN * 60:
+        return
+
+    port = state["portfolio"]
+    cash = port["portfolio_eur"]
+
+    # actuele holdings-waarde
+    holdings_val = 0.0
+    for p in pairs:
+        qty = state["portfolio"]["coins"][p]["qty"]
+        if qty > 0:
+            px = float(ex.fetch_ticker(p)["last"])
+            holdings_val += qty * px
+
+    # hoeveelheid cash nodig om totaal (cash+holdings) ≈ CAPITAL_EUR te houden
+    needed_cash = max(0.0, CAPITAL_EUR - holdings_val) + MIN_CASH_BUFFER_EUR
+    surplus = cash - needed_cash
+
+    if surplus >= SKIM_MIN_EUR:
+        port["portfolio_eur"] -= surplus
+        port["profit_eur"]    += surplus
+        print(f"[SKIM] afgeroomd €{surplus:.2f} → profit_pot; "
+              f"cash=€{port['portfolio_eur']:.2f} | profit=€{port['profit_eur']:.2f}")
+        last_skim_ts[0] = now
+
 # ------------------ Main ------------------
 def main():
     pairs = [x.strip().upper() for x in COINS_CSV.split(",") if x.strip()]
@@ -265,7 +286,7 @@ def main():
         raise SystemExit("Geen geldige markten gevonden op exchange.")
 
     print(f"== PAPER GRID start | capital=€{CAPITAL_EUR:.2f} |"
-          f" levels={GRID_LEVELS} | fee={FEE_PCT*100:.3f}% |"
+          f" levels={GRID_LEVELS} | fee=0.{int(FEE_PCT*1000):03d}% |"
           f" pairs={pairs} | weights={weights} | factor={ORDER_SIZE_FACTOR}"
           f" | buffer=€{MIN_CASH_BUFFER_EUR:.0f}")
 
@@ -292,22 +313,15 @@ def main():
 
     last_equity_day = None
     last_sum = 0.0
+    last_skim_ts = [0.0]
 
     while True:
         try:
-            # Dagelijks: equity snapshot + daily PnL regel
+            # Dagelijkse equity snapshot (trading equity excl. profit-pot)
             today = datetime.now(timezone.utc).date().isoformat()
             if today != last_equity_day:
                 equity = mark_to_market(ex, state, pairs)
                 append_csv(EQUITY_CSV, [today, f"{equity:.2f}"])
-
-                last_daily = read_last_row(DAILY_PNL_CSV)  # [date,equity,realized,day,cum]
-                prev_equity = float(last_daily[1]) if last_daily and len(last_daily) >= 2 else CAPITAL_EUR
-                realized = float(state["portfolio"]["pnl_realized"])
-                day_pnl  = equity - prev_equity
-                cum_pnl  = equity - CAPITAL_EUR
-                append_csv(DAILY_PNL_CSV, [today, f"{equity:.2f}", f"{realized:.2f}", f"{day_pnl:.2f}", f"{cum_pnl:.2f}"])
-
                 last_equity_day = today
 
             # Per pair prijs ophalen en fills simuleren
@@ -319,14 +333,21 @@ def main():
                 if logs:
                     print("\n".join(logs))
 
+            # Winst afromen zodat trading-equity rond CAPITAL_EUR blijft
+            skim_profits_if_needed(ex, state, pairs, last_skim_ts)
+
             # Periodieke samenvatting
             now = time.time()
             if now - last_sum >= LOG_SUMMARY_SEC:
-                eq   = mark_to_market(ex, state, pairs)
-                cash = state["portfolio"]["portfolio_eur"]
-                pr   = state["portfolio"]["pnl_realized"]
-                cum  = eq - CAPITAL_EUR
-                print(f"[SUMMARY] equity=€{eq:.2f} | cash=€{cash:.2f} | pnl_realized=€{pr:.2f} | cum_pnl=€{cum:.2f}")
+                trading_eq = mark_to_market(ex, state, pairs)          # excl. profit-pot
+                cash       = state["portfolio"]["portfolio_eur"]
+                realized   = state["portfolio"]["pnl_realized"]
+                skimmed    = state["portfolio"]["profit_eur"]
+                total_net  = trading_eq + skimmed                      # trading + profit-pot
+
+                print(f"[SUMMARY] trading_equity=€{trading_eq:.2f} | cash=€{cash:.2f} "
+                      f"| pnl_realized=€{realized:.2f} | profit_pot=€{skimmed:.2f} "
+                      f"| total_net=€{total_net:.2f} | target=€{CAPITAL_EUR:.2f}")
                 last_sum = now
 
             save_state(state)
