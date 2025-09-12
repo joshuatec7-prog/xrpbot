@@ -1,136 +1,111 @@
-# report_paper.py — uitgebreid dagrapport (gerealiseerd + schatting ongerealiseerd)
+# report_paper.py — leest /var/data/* en print overzicht met 'Sinds start' totaal
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
-import os, sys, json
+from datetime import datetime, timezone
 import pandas as pd
-
-import ccxt  # voor actuele prijs t.b.v. ongerealiseerd
+import os
+import sys
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
 TRADES   = DATA_DIR / "trades.csv"
 EQUITY   = DATA_DIR / "equity.csv"
-STATE    = DATA_DIR / "state.json"
-
-EXCHANGE_ID = os.getenv("EXCHANGE", "bitvavo")
-COINS_CSV   = os.getenv("COINS", "BTC/EUR,ETH/EUR,SOL/EUR,XRP/EUR,LTC/EUR").strip()
 
 def ts():
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
-def load_exchange():
-    try:
-        klass = getattr(ccxt, EXCHANGE_ID)
-        ex = klass({"enableRateLimit": True})
-        ex.load_markets()
-        return ex
-    except Exception:
-        return None
-
-def last_close_price(ex, pair: str) -> float:
-    if ex is None:
-        return float('nan')
-    try:
-        t = ex.fetch_ticker(pair)
-        return float(t["last"])
-    except Exception:
-        return float('nan')
-
-def unrealized_from_state(ex) -> float:
-    """Schat ongerealiseerde PnL voor LONG lots uit state.json."""
-    if not STATE.exists():
-        return 0.0
-    try:
-        state = json.loads(STATE.read_text(encoding="utf-8"))
-    except Exception:
-        return 0.0
-
-    grids = (state or {}).get("grids", {})
-    if not grids:
-        return 0.0
-
-    total_unreal = 0.0
-    for pair, g in grids.items():
-        lots = g.get("inventory_lots", []) or []
-        if not lots:
-            continue
-        px = last_close_price(ex, pair)
-        if not px or px != px:
-            continue  # NaN of 0
-        for lot in lots:
-            try:
-                qty = float(lot["qty"])
-                buy = float(lot["buy_price"])
-                total_unreal += qty * (px - buy)  # fees buiten beschouwing
-            except Exception:
-                pass
-    return total_unreal
-
 def main():
-    print(f"==> PAPIER GRID RAPPORT ++  {ts()}")
+    print(f"==> PAPER GRID RAPPORT ==  {ts()}")
 
-    # ===== Gerealiseerde winst per dag =====
     if not TRADES.exists():
-        print("(geen trades)")
-        return
+        print("(geen trades)"); return
 
+    # --- Data inlezen & normaliseren
     df = pd.read_csv(TRADES)
-    # schoonmaken
+    # kolomnamen die we gebruiken: timestamp, side, fee_eur, realized_pnl_eur, price, amount, pair
     for col in ("price","amount","fee_eur","realized_pnl_eur"):
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = 0.0
     # timestamp -> date
-    if "timestamp" in df.columns:
-        df["date"] = pd.to_datetime(df["timestamp"], errors="coerce").dt.date
-    else:
-        df["date"] = pd.NaT
+    try:
+        dt = pd.to_datetime(df["timestamp"], errors="coerce")
+    except Exception:
+        dt = pd.to_datetime(df.iloc[:,0], errors="coerce")  # fallback: 1e kolom
+    df["date"] = dt.dt.tz_localize(None).dt.date
 
-    realized_day = df.groupby("date")["realized_pnl_eur"].sum().sort_index()
+    # --- Aggregates
+    fees = float(df["fee_eur"].sum())
+    realized_total = float(df["realized_pnl_eur"].sum())  # <== Sinds start (totaal)
+    wins  = int((df["realized_pnl_eur"] > 0).sum())
+    closes = int((df["side"] == "SELL").sum())
+    winrate = (wins / closes * 100.0) if closes else 0.0
 
-    print("\n-- Dagelijkse gerealiseerde winst (laatste 10 dagen) --")
-    tail = realized_day.tail(10)
-    for d, v in tail.items():
-        print(f"{d} | realized=€{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-    # periode sommen
-    today = datetime.now().date()
-    d7   = today - timedelta(days=6)
-    d30  = today - timedelta(days=29)
-
-    r7  = realized_day.loc[realized_day.index >= d7].sum() if len(realized_day) else 0.0
-    r30 = realized_day.loc[realized_day.index >= d30].sum() if len(realized_day) else 0.0
-
-    print("\n-- Periode winst --")
-    print(f"7d:  €{r7:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    print(f"30d: €{r30:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-    # ===== Laatste equity =====
+    # Equity laatste waarde (optioneel)
     latest_eq = "-"
     if EQUITY.exists():
         try:
             e = pd.read_csv(EQUITY)
-            if "total_equity_eur" in e.columns and len(e):
-                latest_eq = f"€{float(e['total_equity_eur'].iloc[-1]):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            latest_eq = f"€{float(e['total_equity_eur'].iloc[-1]):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         except Exception:
             pass
 
-    # ===== Ongerealiseerde schatting uit state =====
-    ex = load_exchange()
-    unreal = unrealized_from_state(ex)
-    unreal_txt = f"€{unreal:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    # Dag-tot-dag realized (alleen SELL-regels bevatten realized)
+    daily = (
+        df.groupby("date", dropna=True)["realized_pnl_eur"]
+          .sum()
+          .sort_index()
+    )
 
-    # print samenvatting
-    print("\n-- Samenvatting --")
+    # 7d en 30d som (op basis van date-index)
+    if not daily.empty:
+        last_date = daily.index.max()
+        d7  = float(daily.loc[[d for d in daily.index if (last_date - d).days < 7]].sum())
+        d30 = float(daily.loc[[d for d in daily.index if (last_date - d).days < 30]].sum())
+    else:
+        d7 = d30 = 0.0
+
+    # ====== Output ======
+    print("-- Samenvatting --")
     print(f"Equity (laatst): {latest_eq}")
-    print(f"Ongerealiseerd (schatting longs): {unreal_txt}")
+    print(f"Total fees: €{fees:.2f}")
+    print(f"Totale realized (sinds start): €{realized_total:.2f}")
+    print(f"Winrate:      {winrate:.1f}% (wins={wins} / closes={closes})")
 
-    # Optioneel: target tonen
-    target = os.getenv("TARGET_EQUITY_EUR", "50000")
-    try:
-        tgt = float(target)
-        print(f"Target trading equity: €{tgt:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    except Exception:
-        pass
+    # Per pair overzicht
+    if "pair" in df.columns:
+        print("\n-- Per pair --")
+        for pair, sub in df.groupby("pair"):
+            f = float(sub["fee_eur"].sum())
+            p = float(sub["realized_pnl_eur"].sum())
+            buys  = int((sub["side"]=="BUY").sum())
+            sells = int((sub["side"]=="SELL").sum())
+            print(f"{pair:<8} | trades={len(sub):>3} | fees=€{f:>6.2f} | realized=€{p:>7.2f} | buys={buys} / sells={sells}")
+
+    # Laatste 10 trades
+    print("\n-- Laatste 10 trades --")
+    tail = df.tail(10).copy()
+    for _, r in tail.iterrows():
+        dt_str = str(r.get("timestamp",""))[:19]
+        pair   = r.get("pair","")
+        side   = r.get("side","")
+        price  = float(r.get("price",0) or 0)
+        amt    = float(r.get("amount",0) or 0)
+        pnl    = float(r.get("realized_pnl_eur",0) or 0)
+        print(f"{dt_str} | {pair:>7} | {side:4} | €{price:>10.6f} | {amt:>10.6f} | pnl=€{pnl:>6.2f}")
+
+    # Dagelijkse winst (zoals je gewend bent)
+    print("\n-- Dagelijkse winst (laatste 10 dagen) --")
+    if not daily.empty:
+        last10 = daily.tail(10)
+        for d, val in last10.items():
+            print(f"{d} | equity=? | dag=€{val:.2f}")  # equity per dag blijft optioneel
+    else:
+        print("(geen realized data)")
+
+    # Periode winst (7d/30d)
+    print("\n-- Periode winst --")
+    print(f"7d:  €{d7:.2f}")
+    print(f"30d: €{d30:.2f}")
 
 if __name__ == "__main__":
     main()
