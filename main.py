@@ -76,6 +76,12 @@ OPERATOR_ID     = os.getenv("OPERATOR_ID", "").strip()
 LOG_TRADES      = os.getenv("LOG_TRADES", "true").lower() in ("1","true","yes")
 LOG_SUMMARY_SEC = int(os.getenv("LOG_SUMMARY_SEC", "600"))
 
+# ======= Anti-dubbel / concurrency ENV =======
+OPEN_ORDER_BLOCK_SEC = int(os.getenv("OPEN_ORDER_BLOCK_SEC", "90"))   # blokkeer BUY zolang er net een open order was
+BUY_LOCK_SEC         = int(os.getenv("BUY_LOCK_SEC", "120"))          # geldigheid global lock (sec)
+BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", "120"))      # extra cool-down na BUY
+LOCK_FILE_PATH       = os.getenv("LOCK_FILE_PATH", "/var/data/live_buy.lock")
+
 # ========== Logging ==========
 LOG_DIR = pathlib.Path(".")
 LOG_DIR.mkdir(exist_ok=True)
@@ -201,6 +207,43 @@ def net_change_pct(cur_px: float, entry: float, fee_pct: float) -> float:
     gross = (cur_px - entry) / entry
     return gross - 2 * fee_pct
 
+# ========== Anti-dubbel helpers ==========
+LOCK_FILE = pathlib.Path(LOCK_FILE_PATH)
+
+def buy_lock_available() -> bool:
+    """True als er geen recente globale buy-lock is."""
+    try:
+        if LOCK_FILE.exists():
+            age = time.time() - LOCK_FILE.stat().st_mtime
+            return age > BUY_LOCK_SEC
+        return True
+    except Exception:
+        return True
+
+def acquire_buy_lock():
+    """Schrijf/refresh lock timestamp; directory maken als nodig."""
+    try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LOCK_FILE.write_text(str(time.time()), encoding="utf-8")
+    except Exception:
+        pass
+
+def has_recent_open_order(ex, symbol: str) -> bool:
+    """True als er (heel) recent nog een open order was/hing."""
+    try:
+        orders = with_retry(ex.fetch_open_orders, symbol)
+        now = time.time()
+        for o in orders or []:
+            ts = o.get("timestamp") or o.get("datetime")
+            if isinstance(ts, (int, float)):
+                age = now - (ts/1000.0)
+                if age < OPEN_ORDER_BLOCK_SEC:
+                    return True
+        # Als je het nog strenger wil, zou je hier: return len(orders or []) > 0 zetten
+        return False
+    except Exception:
+        return False
+
 # ========== Order helpers ==========
 def market_buy_eur(spend_eur: float, px: float) -> float:
     spend_eur = float(f"{spend_eur:.2f}")  # Bitvavo cost = 2 decimalen
@@ -296,25 +339,32 @@ while True:
 
         # === BUY-logica: alleen als GEEN positie ===
         if sig == "BUY":
+            # Eén-positie-gates
             if STRICT_ONE_AT_A_TIME and position_amt > 1e-8:
                 print("[LIVE] BUY geblokkeerd: positie open (STRICT_ONE_AT_A_TIME).")
-                time.sleep(SLEEP_SEC)
-                continue
-
+                time.sleep(SLEEP_SEC); continue
             if ONE_POSITION_ONLY and position_amt > 0:
                 print("[LIVE] BUY geblokkeerd: ONE_POSITION_ONLY.")
-                time.sleep(SLEEP_SEC)
-                continue
+                time.sleep(SLEEP_SEC); continue
 
-            if time.time() - last_trade_ts < TRADE_COOLDOWN_SEC:
-                time.sleep(SLEEP_SEC)
-                continue
+            # Tijdslot (bovenop trade cooldown)
+            if time.time() - last_trade_ts < max(TRADE_COOLDOWN_SEC, BUY_COOLDOWN_SEC):
+                time.sleep(SLEEP_SEC); continue
+
+            # Blokkeer als er nog open (of heel recente) order is
+            if has_recent_open_order(ex, SYMBOL):
+                print("[LIVE] BUY geblokkeerd: open order actief/heel recent.")
+                time.sleep(SLEEP_SEC); continue
+
+            # Global lock: voorkomt dubbele instances
+            if not buy_lock_available():
+                print("[LIVE] BUY geblokkeerd: global buy lock actief.")
+                time.sleep(SLEEP_SEC); continue
 
             room = eur_for_bot()
             if room <= 0.5:
                 print("[LIVE] Geen vrij EUR.")
-                time.sleep(SLEEP_SEC)
-                continue
+                time.sleep(SLEEP_SEC); continue
 
             target = min(EUR_PER_TRADE, MAX_EUR_PER_TRADE, room)
             min_needed = max(MIN_QUOTE, 0.50)
@@ -322,12 +372,13 @@ while True:
                 target = min(min_needed, room, MAX_EUR_PER_TRADE)
                 if target < min_needed:
                     print(f"[LIVE] BUY overslaan: min kost €{min_needed:.2f}.")
-                    time.sleep(SLEEP_SEC)
-                    continue
+                    time.sleep(SLEEP_SEC); continue
 
+            # Lock vastleggen vlak voor de order
+            acquire_buy_lock()
             filled = market_buy_eur(target, px)
+
             if filled > 0:
-                # nieuwe entry & trailing resetten
                 entry_price = px
                 trail_high = px if TRAILING_STOP_PCT > 0.0 else None
                 position_amt += filled
@@ -335,16 +386,14 @@ while True:
                 print(f"[LIVE] BUY ~€{target:.2f} -> {filled:.6f} {BASE} @ €{px:.4f} | pos={position_amt:.6f} | entry=€{entry_price:.4f}")
                 botlog.info("BUY cost=%.2f px=%.6f filled=%.8f", target, px, filled)
                 log_trade(now_iso(), "BUY", px, filled, "SIGNAL_BUY")
-                time.sleep(SLEEP_SEC)
-                continue
+                time.sleep(SLEEP_SEC); continue
 
         # (optioneel) SELL-signaal bij cross omlaag -> alleen als netto winst
         if sig == "SELL" and position_amt > 0 and entry_price:
             net = net_change_pct(px, entry_price, FEE_PCT)
             if net >= MIN_PROFIT_PCT:
                 sell_all_now(px, "SIGNAL_SELL")
-                time.sleep(SLEEP_SEC)
-                continue
+                time.sleep(SLEEP_SEC); continue
 
         time.sleep(SLEEP_SEC)
 
