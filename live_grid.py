@@ -14,8 +14,8 @@ import ccxt
 import pandas as pd
 
 # --------------- ENV ---------------
-API_KEY    = os.getenv("21f241626104132f3e22db8fe09dee540bb5f86ef13e514974b178151bc75baf", "")
-API_SECRET = os.getenv("47f2e90ad6460ce8ce52ffefb9ce157c52b02649f3de4d0048de383e21871c92d51972291185f4c80e12794d3593c0bc84179ed951cfcdf289d4e146cb622a91", "")
+API_KEY    = os.getenv("83d4d6fc710acf83996bdf182d5aed240f3fea05bc1a03bc9a620d789f3c19c6", "")
+API_SECRET = os.getenv("246b15d3ac84fe5602c8538a9f4d60e81da4977fc5b0ab8c13d996245bd016beccbea128c6f0cb877edb918a8e5563d5ce47897f17b307eb2d8ec806758e91be", "")
 
 CAPITAL_TARGET = float(os.getenv("TARGET_CAPITAL_EUR", "1000"))  # max equity in gebruik
 SKIM_PROFITS   = os.getenv("SKIM_PROFITS", "true").lower() in ("1","true","yes")
