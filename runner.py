@@ -2,10 +2,10 @@
 import os, time, sys, subprocess, csv
 from pathlib import Path
 
-REPORT_EVERY_HOURS = float(os.getenv("REPORT_EVERY_HOURS","6"))
-SLEEP_HEARTBEAT_SEC = int(os.getenv("SLEEP_HEARTBEAT_SEC","300"))
-DATA_DIR = Path(os.getenv("DATA_DIR","/var/data"))
-EQUITY_CSV = DATA_DIR / "equity.csv"
+REPORT_EVERY_HOURS = float(os.getenv("REPORT_EVERY_HOURS", "6"))
+SLEEP_HEARTBEAT_SEC = int(os.getenv("SLEEP_HEARTBEAT_SEC", "300"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))  # zelfde default als live_grid.py
+EQUITY_CSV = DATA_DIR / "live_equity.csv"       # zelfde bestandsnaam als live_grid.py
 
 def latest_equity() -> str:
     try:
@@ -39,7 +39,7 @@ def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     grid = start_grid()
 
-    # meteen 1e rapport forceren
+    # meteen eerste rapport
     last_report_ts = 0.0
     run_report_once()
     last_report_ts = time.time()
