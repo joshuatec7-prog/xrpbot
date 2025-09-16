@@ -1,9 +1,10 @@
 # live_grid.py
 # --- Multi-coin LIVE grid bot (Bitvavo) ---
-# - Harde capital cap op CAPITAL_EUR (niet herinvesteren van winst)
-# - Verkoop ALLEEN bij netto winst (MIN_PROFIT_PCT óf MIN_PROFIT_EUR)
+# - Harde cap: SOM(kostprijs open lots) ≤ CAPITAL_EUR
+# - Koopt alleen als er genoeg vrij EUR + fee is (Bitvavo error 216 voorkomen)
+# - Verkoopt ALLEEN bij netto winst (MIN_PROFIT_PCT óf MIN_PROFIT_EUR)
 # - CSV logging: data/live_trades.csv, data/live_equity.csv
-# - Console samenvattingen elke LOG_SUMMARY_SEC en rapport elke REPORT_EVERY_HOURS
+# - Console logs met kleur (BUY=cyaan, SELL groen/rood)
 
 import csv
 import json
@@ -18,9 +19,9 @@ import ccxt
 import pandas as pd
 
 # ---------- ANSI kleuren ----------
-COL_G = "\033[92m"  # groen
-COL_R = "\033[91m"  # rood
-COL_C = "\033[96m"  # cyaan (BUY)
+COL_G = "\033[92m"   # groen
+COL_R = "\033[91m"   # rood
+COL_C = "\033[96m"   # cyaan (BUY)
 COL_RESET = "\033[0m"
 
 # ---------- helpers ----------
@@ -51,6 +52,14 @@ def save_json(path: Path, obj):
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
 
+def free_eur_on_exchange(ex) -> float:
+    try:
+        bal = ex.fetch_balance()
+        free = bal.get("free") or {}
+        return float(free.get("EUR") or 0.0)
+    except Exception:
+        return 0.0
+
 # ---------- ENV / Defaults (alfabetisch) ----------
 API_KEY      = os.getenv("API_KEY", "")
 API_SECRET   = os.getenv("API_SECRET", "")
@@ -69,15 +78,12 @@ MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.006"))
 OPERATOR_ID  = os.getenv("OPERATOR_ID", "").strip()
 ORDER_SIZE_FACTOR = float(os.getenv("ORDER_SIZE_FACTOR", "1.8"))
 REPORT_EVERY_HOURS = float(os.getenv("REPORT_EVERY_HOURS", "4"))
-SKIM_INTERVAL_MIN = int(os.getenv("SKIM_INTERVAL_MIN", "15"))
-SKIM_MIN_EUR = float(os.getenv("SKIM_MIN_EUR", "10"))
-SKIM_PROFITS = os.getenv("SKIM_PROFITS", "true").lower() in ("1","true","yes")
 SLEEP_HEARTBEAT_SEC = int(os.getenv("SLEEP_HEARTBEAT_SEC","300"))
 SLEEP_SEC     = int(os.getenv("SLEEP_SEC", "15"))
 WEIGHTS_CSV   = os.getenv("WEIGHTS","BTC/EUR:0.35,ETH/EUR:0.30,SOL/EUR:0.15,XRP/EUR:0.10,LTC/EUR:0.10").strip()
 
 if not API_KEY or not API_SECRET:
-    raise SystemExit("API_KEY / API_SECRET ontbreken (Render → Environment).")
+    raise SystemExit("API_KEY / API_SECRET ontbreken.")
 
 # ---------- storage ----------
 try:
@@ -161,7 +167,6 @@ def init_portfolio(pairs: List[str], weights: Dict[str, float]) -> dict:
         "cash_eur": CAPITAL_EUR,
         "pnl_realized": 0.0,
         "coins": {p: {"qty": 0.0, "cash_alloc": CAPITAL_EUR * weights[p]} for p in pairs},
-        "last_skim_ts": 0.0,
     }
 
 def euro_per_ticket(cash_alloc: float, n_levels: int) -> float:
@@ -179,14 +184,12 @@ def mark_to_market(ex, state: dict, pairs: List[str]) -> float:
             total += qty * px
     return total
 
-def portfolio_exposure_eur(ex, port: dict, pairs: List[str]) -> float:
-    expo = 0.0
-    for p in pairs:
-        qty = port["coins"][p]["qty"]
-        if qty > 0:
-            px = float(ex.fetch_ticker(p)["last"])
-            expo += qty * px
-    return expo
+def invested_cost_eur(state: dict) -> float:
+    tot = 0.0
+    for g in state["grids"].values():
+        for lot in g["inventory_lots"]:
+            tot += lot["qty"] * lot["buy_price"]
+    return tot
 
 # ---------- winst en fills ----------
 def net_gain_ok(buy_price: float, sell_avg: float, fee_pct: float,
@@ -201,7 +204,7 @@ def net_gain_ok(buy_price: float, sell_avg: float, fee_pct: float,
 def buy_market(ex, pair: str, eur: float) -> Tuple[float, float, float]:
     if eur < 5.0:
         return 0.0, 0.0, 0.0
-    params = {"cost": float(f"{eur:.2f}")}  # Bitvavo: market buy by cost
+    params = {"cost": float(f"{eur:.2f}")}  # Bitvavo: market buy by quote cost
     if OPERATOR_ID:
         params["operatorId"] = OPERATOR_ID
     order = ex.create_order(pair, "market", "buy", None, None, params)
@@ -224,45 +227,50 @@ def sell_market(ex, pair: str, qty: float) -> Tuple[float, float, float]:
 
 # ---------- grid logica ----------
 def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
-                  grid: dict, port: dict, pairs_all: List[str]) -> List[str]:
+                  state: dict, grid: dict) -> List[str]:
     levels = grid["levels"]
+    port = state["portfolio"]
     logs: List[str] = []
     if not levels:
         return logs
 
-    # BUY: neerwaartse cross → ticket als cash én exposure het toelaten
+    # BUY: neerwaartse cross → koop als EUR + fee + cost-cap het toelaten
     if price_prev is not None and price_now < price_prev:
         crossed = [L for L in levels if price_now < L <= price_prev]
+        avail_local = free_eur_on_exchange(ex)
         for _ in crossed:
-            ticket_eur = euro_per_ticket(port["coins"][pair]["cash_alloc"], len(levels))
-            exposure = portfolio_exposure_eur(ex, port, pairs_all)
+            ticket_eur_base = euro_per_ticket(port["coins"][pair]["cash_alloc"], len(levels))
 
-            # buffer-check
-            if (port["cash_eur"] - MIN_CASH_BUFFER_EUR) < ticket_eur:
-                logs.append(f"{COL_C}[{pair}] BUY skip: onvoldoende cash (buffer).{COL_RESET}")
+            # maximaal te spenderen kost op basis van vrij EUR en fee
+            max_cost = max(0.0, avail_local - MIN_CASH_BUFFER_EUR) / (1.0 + FEE_PCT)
+            cost = min(ticket_eur_base, max_cost)
+
+            # cost-cap guard
+            if invested_cost_eur(state) + cost > CAPITAL_EUR + 1e-6:
+                logs.append(f"{COL_C}[{pair}] BUY skip: cost-cap bereikt.{COL_RESET}")
                 continue
 
-            # cap-check: blokkeer alleen als som NU al boven cap ligt
-            if (port["cash_eur"] + exposure) > (CAPITAL_EUR + 1e-6):
-                logs.append(f"{COL_C}[{pair}] BUY skip: capital cap bereikt.{COL_RESET}")
+            if cost < 5.0:
+                logs.append(f"{COL_C}[{pair}] BUY skip: onvoldoende vrij EUR op exchange.{COL_RESET}")
                 continue
 
-            qty, avgp, fee_eur = buy_market(ex, pair, ticket_eur)
+            qty, avgp, fee_eur = buy_market(ex, pair, cost)
             if qty <= 0 or avgp <= 0:
                 continue
 
             grid["inventory_lots"].append({"qty": qty, "buy_price": avgp})
-            port["cash_eur"] -= (ticket_eur + fee_eur)
+            port["cash_eur"] -= (cost + fee_eur)
             port["coins"][pair]["qty"] += qty
+            avail_local -= (cost + fee_eur)  # voorkom dubbele buys boven saldo in dezelfde tick
 
             append_csv(
                 TRADES_CSV,
-                [now_iso(), pair, "BUY", f"{avgp:.6f}", f"{qty:.8f}", f"{ticket_eur:.2f}", f"{port['cash_eur']:.2f}",
+                [now_iso(), pair, "BUY", f"{avgp:.6f}", f"{qty:.8f}", f"{cost:.2f}", f"{port['cash_eur']:.2f}",
                  pair.split("/")[0], f"{port['coins'][pair]['qty']:.8f}", "", "grid_buy"],
                 header=["timestamp","pair","side","avg_price","qty","eur","cash_eur",
                         "base","base_qty","pnl_eur","comment"]
             )
-            logs.append(f"{COL_C}[{pair}] BUY {qty:.8f} @ €{avgp:.6f} | cost≈€{ticket_eur:.2f} | fee≈€{fee_eur:.2f} | cash=€{port['cash_eur']:.2f}{COL_RESET}")
+            logs.append(f"{COL_C}[{pair}] BUY {qty:.8f} @ €{avgp:.6f} | cost≈€{cost:.2f} | fee≈€{fee_eur:.2f} | cash=€{port['cash_eur']:.2f}{COL_RESET}")
 
     # SELL: winst-gestuurd per lot
     if grid["inventory_lots"]:
@@ -307,7 +315,6 @@ def main():
 
     weights = normalize_weights(pairs, WEIGHTS_CSV)
 
-    # state laden
     state = load_json(STATE_FILE, {}) if STATE_FILE.exists() else {}
     if "portfolio" not in state:
         state["portfolio"] = init_portfolio(pairs, weights)
@@ -317,7 +324,6 @@ def main():
         if p not in state["grids"]:
             state["grids"][p] = mk_grid_state(ex, p, GRID_LEVELS)
 
-    # baseline note
     if LOCK_PREEXISTING_BALANCE and "baseline" not in state:
         bal = ex.fetch_balance().get("free", {})
         state["baseline"] = {p.split("/")[0]: float(bal.get(p.split("/")[0], 0) or 0.0) for p in pairs}
@@ -346,12 +352,13 @@ def main():
             now_ts = time.time()
             if now_ts - last_summary_ts >= LOG_SUMMARY_SEC:
                 since_start = eq - CAPITAL_EUR
-                col_start = COL_G if since_start >= 0 else COL_R
+                col = COL_G if since_start >= 0 else COL_R
                 pr = state["portfolio"]["pnl_realized"]
                 cash = state["portfolio"]["cash_eur"]
+                inv = invested_cost_eur(state)
                 print(
-                    f"[SUMMARY] total_eq=€{eq:.2f} | cash=€{cash:.2f} | pnl_realized=€{pr:.2f} | "
-                    f"since_start={col_start}{since_start:.2f}{COL_RESET}"
+                    f"[SUMMARY] total_eq=€{eq:.2f} | cash=€{cash:.2f} | invested_cost=€{inv:.2f} | "
+                    f"pnl_realized=€{pr:.2f} | since_start={col}{since_start:.2f}{COL_RESET}"
                 )
                 last_summary_ts = now_ts
 
@@ -360,19 +367,20 @@ def main():
                 t = ex.fetch_ticker(p)
                 px = float(t["last"])
                 grid = state["grids"][p]
-                logs = try_grid_live(ex, p, px, grid["last_price"], grid, state["portfolio"], pairs)
+                logs = try_grid_live(ex, p, px, grid["last_price"], state, grid)
                 if logs:
                     print("\n".join(logs))
 
-            # rapport tick (console)
+            # periodiek report
             if time.time() - last_report_ts >= REPORT_EVERY_HOURS * 3600:
                 pr = state["portfolio"]["pnl_realized"]
                 cash = state["portfolio"]["cash_eur"]
+                inv = invested_cost_eur(state)
                 since_start = eq - CAPITAL_EUR
-                col_start = COL_G if since_start >= 0 else COL_R
+                col = COL_G if since_start >= 0 else COL_R
                 print(
-                    f"[REPORT] total_eq=€{eq:.2f} | cash=€{cash:.2f} | pnl_realized=€{pr:.2f} | "
-                    f"since_start={col_start}{since_start:.2f}{COL_RESET} | pairs={pairs}"
+                    f"[REPORT] total_eq=€{eq:.2f} | cash=€{cash:.2f} | invested_cost=€{inv:.2f} | "
+                    f"pnl_realized=€{pr:.2f} | since_start={col}{since_start:.2f}{COL_RESET} | pairs={pairs}"
                 )
                 last_report_ts = time.time()
 
