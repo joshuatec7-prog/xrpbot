@@ -1,9 +1,11 @@
 # live_grid.py
 # --- Multi-coin LIVE grid bot (Bitvavo) ---
-# - Harde cap: SOM(kostprijs open lots) ≤ CAPITAL_EUR
+# - Baseline-protect: verkoop alleen boven je startvoorraad
+# - Live-cap: waarde(bot-voorraad boven baseline) ≤ CAPITAL_EUR
+# - Cost-cap: som(kostprijzen van open lots) ≤ CAPITAL_EUR
 # - Koopt alleen met voldoende vrij EUR + fee
-# - Verkoopt ALLEEN bij netto winst, en nooit onder baseline van je eigen holdings
-# - CSV logging: data/live_trades.csv, data/live_equity.csv
+# - Verkoopt ALLEEN bij netto winst (MIN_PROFIT_PCT of MIN_PROFIT_EUR)
+# - CSV: data/live_trades.csv, data/live_equity.csv
 
 import csv
 import json
@@ -66,6 +68,24 @@ def free_base_on_exchange(ex, base: str) -> float:
         return float(free.get(base) or 0.0)
     except Exception:
         return 0.0
+
+def bot_inventory_value_eur_from_exchange(ex, state: dict, pairs: List[str]) -> float:
+    """Waarde EUR van bot-voorraad = max(free_base - baseline, 0) * last."""
+    try:
+        free = (ex.fetch_balance().get("free") or {})
+    except Exception:
+        free = {}
+    baselines = state.get("baseline", {}) if LOCK_PREEXISTING_BALANCE else {}
+    tot = 0.0
+    for p in pairs:
+        base = p.split("/")[0]
+        qty_free = float(free.get(base) or 0.0)
+        baseline = float(baselines.get(base, 0.0) or 0.0)
+        bot_qty = max(0.0, qty_free - baseline)
+        if bot_qty > 0:
+            px = float(ex.fetch_ticker(p)["last"])
+            tot += bot_qty * px
+    return tot
 
 # ---------- ENV / Defaults ----------
 API_KEY      = os.getenv("API_KEY", "")
@@ -230,34 +250,49 @@ def sell_market(ex, pair: str, qty: float) -> Tuple[float, float, float]:
 
 # ---------- grid logica ----------
 def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
-                  state: dict, grid: dict) -> List[str]:
+                  state: dict, grid: dict, pairs_all: List[str]) -> List[str]:
     levels = grid["levels"]
     port = state["portfolio"]
     logs: List[str] = []
     if not levels:
         return logs
 
-    # BUY: neerwaartse cross → koop als EUR + fee + cost-cap het toelaten
+    # BUY: neerwaartse cross → koop als EUR+fee, cost-cap en live-cap het toelaten
     if price_prev is not None and price_now < price_prev:
         crossed = [L for L in levels if price_now < L <= price_prev]
         avail_local = free_eur_on_exchange(ex)
+        inv_live_cap = bot_inventory_value_eur_from_exchange(ex, state, pairs_all)
         for _ in crossed:
             ticket_eur_base = euro_per_ticket(port["coins"][pair]["cash_alloc"], len(levels))
+
+            # vrij EUR inclusief fee reservering
             max_cost = max(0.0, avail_local - MIN_CASH_BUFFER_EUR) / (1.0 + FEE_PCT)
             cost = min(ticket_eur_base, max_cost)
+
+            # cost-cap guard
             if invested_cost_eur(state) + cost > CAPITAL_EUR + 1e-6:
                 logs.append(f"{COL_C}[{pair}] BUY skip: cost-cap bereikt.{COL_RESET}")
                 continue
+
+            # live-cap guard op echte exchange-voorraad boven baseline
+            if inv_live_cap + cost > CAPITAL_EUR + 1e-6:
+                logs.append(f"{COL_C}[{pair}] BUY skip: live-cap bereikt (bot_inv≈€{inv_live_cap:.2f}).{COL_RESET}")
+                continue
+
             if cost < 5.0:
                 logs.append(f"{COL_C}[{pair}] BUY skip: onvoldoende vrij EUR op exchange.{COL_RESET}")
                 continue
+
             qty, avgp, fee_eur = buy_market(ex, pair, cost)
             if qty <= 0 or avgp <= 0:
                 continue
+
             grid["inventory_lots"].append({"qty": qty, "buy_price": avgp})
             port["cash_eur"] -= (cost + fee_eur)
             port["coins"][pair]["qty"] += qty
             avail_local -= (cost + fee_eur)
+            inv_live_cap += cost  # benadering
+
             append_csv(
                 TRADES_CSV,
                 [now_iso(), pair, "BUY", f"{avgp:.6f}", f"{qty:.8f}", f"{cost:.2f}", f"{port['cash_eur']:.2f}",
@@ -340,8 +375,11 @@ def main():
     while True:
         try:
             eq = mark_to_market(ex, state, pairs)
-            append_csv(EQUITY_CSV, [datetime.now(timezone.utc).date().isoformat(), f"{eq:.2f}"],
-                       header=["date", "total_equity_eur"])
+            append_csv(
+                EQUITY_CSV,
+                [datetime.now(timezone.utc).date().isoformat(), f"{eq:.2f}"],
+                header=["date", "total_equity_eur"]
+            )
 
             now_ts = time.time()
             if now_ts - last_summary_ts >= LOG_SUMMARY_SEC:
@@ -349,25 +387,37 @@ def main():
                 col = COL_G if since_start >= 0 else COL_R
                 pr = state["portfolio"]["pnl_realized"]
                 cash = state["portfolio"]["cash_eur"]
-                inv = invested_cost_eur(state)
-                print(f"[SUMMARY] total_eq=€{eq:.2f} | cash=€{cash:.2f} | invested_cost=€{inv:.2f} | pnl_realized=€{pr:.2f} | since_start={col}{since_start:.2f}{COL_RESET}")
+                inv_cost = invested_cost_eur(state)
+                free_eur = free_eur_on_exchange(ex)
+                live_inv = bot_inventory_value_eur_from_exchange(ex, state, pairs)
+                print(
+                    f"[SUMMARY] total_eq=€{eq:.2f} | cash=€{cash:.2f} | free_EUR=€{free_eur:.2f} | "
+                    f"invested_cost=€{inv_cost:.2f} | live_inv=€{live_inv:.2f} | "
+                    f"pnl_realized=€{pr:.2f} | since_start={col}{since_start:.2f}{COL_RESET}"
+                )
                 last_summary_ts = now_ts
 
             for p in pairs:
                 t = ex.fetch_ticker(p)
                 px = float(t["last"])
                 grid = state["grids"][p]
-                logs = try_grid_live(ex, p, px, grid["last_price"], state, grid)
+                logs = try_grid_live(ex, p, px, grid["last_price"], state, grid, pairs)
                 if logs:
                     print("\n".join(logs))
 
             if time.time() - last_report_ts >= REPORT_EVERY_HOURS * 3600:
                 pr = state["portfolio"]["pnl_realized"]
                 cash = state["portfolio"]["cash_eur"]
-                inv = invested_cost_eur(state)
+                inv_cost = invested_cost_eur(state)
+                free_eur = free_eur_on_exchange(ex)
+                live_inv = bot_inventory_value_eur_from_exchange(ex, state, pairs)
                 since_start = eq - CAPITAL_EUR
                 col = COL_G if since_start >= 0 else COL_R
-                print(f"[REPORT] total_eq=€{eq:.2f} | cash=€{cash:.2f} | invested_cost=€{inv:.2f} | pnl_realized=€{pr:.2f} | since_start={col}{since_start:.2f}{COL_RESET} | pairs={pairs}")
+                print(
+                    f"[REPORT] total_eq=€{eq:.2f} | cash=€{cash:.2f} | free_EUR=€{free_eur:.2f} | "
+                    f"invested_cost=€{inv_cost:.2f} | live_inv=€{live_inv:.2f} | "
+                    f"pnl_realized=€{pr:.2f} | since_start={col}{since_start:.2f}{COL_RESET} | pairs={pairs}"
+                )
                 last_report_ts = time.time()
 
             save_json(STATE_FILE, state)
