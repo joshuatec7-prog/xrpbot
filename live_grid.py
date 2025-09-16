@@ -1,10 +1,10 @@
 # live_grid.py
 # --- Multi-coin LIVE grid bot (Bitvavo) ---
 # - Beschermt bestaande wallet (verkoopt ALLEEN bot-lots)
-# - Speelpot via CAPITAL_EUR (default 1000)
+# - Speelpot via CAPITAL_EUR (default 1000) met harde cap
 # - Verkoop ALLEEN bij netto winst (MIN_PROFIT_PCT óf MIN_PROFIT_EUR)
 # - CSV logging: data/live_trades.csv, data/live_equity.csv
-# - Console samenvattingen elke SLEEP_HEARTBEAT_SEC en rapport elke REPORT_EVERY_HOURS
+# - Console samenvattingen elke LOG_SUMMARY_SEC en rapport elke REPORT_EVERY_HOURS
 
 import csv
 import json
@@ -110,7 +110,6 @@ def normalize_weights(pairs: List[str], weights_csv: str) -> Dict[str, float]:
                     d[k.strip().upper()] = float(v)
                 except Exception:
                     pass
-    # default gelijk verdeeld
     s = sum(d.values())
     if s <= 0:
         eq = 1.0 / len(pairs) if pairs else 0.0
@@ -166,7 +165,7 @@ def init_portfolio(pairs: List[str], weights: Dict[str, float]) -> dict:
 def euro_per_ticket(cash_alloc: float, n_levels: int) -> float:
     if n_levels < 2:
         n_levels = 2
-    base = (cash_alloc * 0.90) / (n_levels // 2)  # 90% van alloc in helft van levels
+    base = (cash_alloc * 0.90) / (n_levels // 2)  # 90% alloc in helft van levels
     return max(5.0, base * ORDER_SIZE_FACTOR)
 
 def mark_to_market(ex, state: dict, pairs: List[str]) -> float:
@@ -177,6 +176,15 @@ def mark_to_market(ex, state: dict, pairs: List[str]) -> float:
             px = float(ex.fetch_ticker(p)["last"])
             total += qty * px
     return total
+
+def portfolio_exposure_eur(ex, port: dict, pairs: List[str]) -> float:
+    expo = 0.0
+    for p in pairs:
+        qty = port["coins"][p]["qty"]
+        if qty > 0:
+            px = float(ex.fetch_ticker(p)["last"])
+            expo += qty * px
+    return expo
 
 # ---------- winst en fills ----------
 def net_gain_ok(buy_price: float, sell_avg: float, fee_pct: float,
@@ -194,7 +202,7 @@ def buy_market(ex, pair: str, eur: float) -> Tuple[float, float, float]:
     """
     if eur < 5.0:
         return 0.0, 0.0, 0.0
-    params = {"cost": float(f"{eur:.2f}")}
+    params = {"cost": float(f"{eur:.2f}")}  # Bitvavo: market buy by cost
     if OPERATOR_ID:
         params["operatorId"] = OPERATOR_ID
     order = ex.create_order(pair, "market", "buy", None, None, params)
@@ -219,20 +227,26 @@ def sell_market(ex, pair: str, qty: float) -> Tuple[float, float, float]:
     return proceeds, avgp, fee_eur
 
 # ---------- grid logica ----------
-def try_grid_live(ex, pair: str, price_now: float, price_prev: float, grid: dict, port: dict) -> List[str]:
+def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
+                  grid: dict, port: dict, pairs_all: List[str]) -> List[str]:
     levels = grid["levels"]
     logs: List[str] = []
     if not levels:
         return logs
 
-    # BUY: neerwaartse cross -> koop ticket als cash het toelaat
+    # BUY: neerwaartse cross -> koop ticket als cash én exposure het toelaten
     if price_prev is not None and price_now < price_prev:
         crossed = [L for L in levels if price_now < L <= price_prev]
-        for L in crossed:
-            fee_eur = 0.0  # schatting
+        for _ in crossed:
             ticket_eur = euro_per_ticket(port["coins"][pair]["cash_alloc"], len(levels))
-            if (port["cash_eur"] - MIN_CASH_BUFFER_EUR) < (ticket_eur + fee_eur):
+
+            # harde cap: nooit boven speelpot
+            exposure = portfolio_exposure_eur(ex, port, pairs_all)
+            if (port["cash_eur"] - MIN_CASH_BUFFER_EUR) < ticket_eur:
                 logs.append(f"[{pair}] BUY skip: onvoldoende cash (buffer).")
+                continue
+            if (port["cash_eur"] + exposure) >= (CAPITAL_EUR - 1e-6):
+                logs.append(f"[{pair}] BUY skip: capital cap bereikt.")
                 continue
 
             qty, avgp, fee_eur = buy_market(ex, pair, ticket_eur)
@@ -252,52 +266,34 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float, grid: dict
             )
             logs.append(f"[{pair}] BUY {qty:.8f} @ €{avgp:.6f} | cost≈€{ticket_eur:.2f} | fee≈€{fee_eur:.2f} | cash=€{port['cash_eur']:.2f}")
 
-    # SELL: opwaartse cross -> verkoop EEN bot-lot, maar alleen bij netto winst
-    if price_prev is not None and price_now > price_prev and grid["inventory_lots"]:
-        crossed = [L for L in levels if price_prev < L <= price_now]
-        for L in crossed:
-            # pak eerste lot dat potentieel winst kan opleveren t.o.v. level
-            lot_idx = None
-            for i, lot in enumerate(grid["inventory_lots"]):
-                if L > lot["buy_price"]:
-                    lot_idx = i
-                    break
-            if lot_idx is None:
-                continue
+    # SELL: winst-gestuurd per lot, onafhankelijk van level-cross
+    if grid["inventory_lots"]:
+        sell_idx = None
+        for i, lot in enumerate(grid["inventory_lots"]):
+            if net_gain_ok(lot["buy_price"], price_now, FEE_PCT, MIN_PROFIT_PCT, MIN_PROFIT_EUR, lot["qty"]):
+                sell_idx = i
+                break
 
-            lot = grid["inventory_lots"][lot_idx]
+        if sell_idx is not None:
+            lot = grid["inventory_lots"][sell_idx]
             qty = lot["qty"]
-
-            # conservatieve winst-check op huidige last
-            if not net_gain_ok(lot["buy_price"], price_now, FEE_PCT, MIN_PROFIT_PCT, MIN_PROFIT_EUR, qty):
-                continue
-
             proceeds, avgp, fee_eur = sell_market(ex, pair, qty)
-            if proceeds <= 0 or avgp <= 0:
-                continue
+            if proceeds > 0 and avgp > 0 and net_gain_ok(lot["buy_price"], avgp, FEE_PCT, MIN_PROFIT_PCT, MIN_PROFIT_EUR, qty):
+                grid["inventory_lots"].pop(sell_idx)
+                pnl = proceeds - fee_eur - (qty * lot["buy_price"])
+                port["cash_eur"] += (proceeds - fee_eur)
+                port["coins"][pair]["qty"] -= qty
+                port["pnl_realized"] += pnl
 
-            # definitieve winst-check met daadwerkelijke fill-avg
-            if not net_gain_ok(lot["buy_price"], avgp, FEE_PCT, MIN_PROFIT_PCT, MIN_PROFIT_EUR, qty):
-                logs.append(f"[{pair}] SELL geannuleerd: netto winst onder drempel (avg=€{avgp:.6f}).")
-                # geen state-mutatie → zichtbaar in cash/pnl als 'geen trade'
-                continue
-
-            # verkoop definitief verwerken
-            grid["inventory_lots"].pop(lot_idx)
-            pnl = proceeds - fee_eur - (qty * lot["buy_price"])
-            port["cash_eur"] += (proceeds - fee_eur)
-            port["coins"][pair]["qty"] -= qty
-            port["pnl_realized"] += pnl
-
-            append_csv(
-                TRADES_CSV,
-                [now_iso(), pair, "SELL", f"{avgp:.6f}", f"{qty:.8f}", f"{proceeds:.2f}", f"{port['cash_eur']:.2f}",
-                 pair.split("/")[0], f"{port['coins'][pair]['qty']:.8f}", f"{pnl:.2f}", "grid_sell"]
-            )
-            logs.append(
-                f"[{pair}] SELL {qty:.8f} @ €{avgp:.6f} | proceeds=€{proceeds:.2f} | fee=€{fee_eur:.2f} "
-                f"| pnl=€{pnl:.2f} | cash=€{port['cash_eur']:.2f}"
-            )
+                append_csv(
+                    TRADES_CSV,
+                    [now_iso(), pair, "SELL", f"{avgp:.6f}", f"{qty:.8f}", f"{proceeds:.2f}", f"{port['cash_eur']:.2f}",
+                     pair.split("/")[0], f"{port['coins'][pair]['qty']:.8f}", f"{pnl:.2f}", "take_profit"]
+                )
+                logs.append(
+                    f"[{pair}] SELL {qty:.8f} @ €{avgp:.6f} | proceeds=€{proceeds:.2f} | fee=€{fee_eur:.2f} "
+                    f"| pnl=€{pnl:.2f} | cash=€{port['cash_eur']:.2f}"
+                )
 
     grid["last_price"] = price_now
     return logs
@@ -356,14 +352,14 @@ def main():
             # korte console summary
             now_ts = time.time()
             if now_ts - last_summary_ts >= LOG_SUMMARY_SEC:
-                day_change = eq - CAPITAL_EUR
-                col_start = "\033[92m" if day_change >= 0 else "\033[91m"
+                since_start = eq - CAPITAL_EUR
+                col_start = "\033[92m" if since_start >= 0 else "\033[91m"
                 col_end = "\033[0m"
                 pr = state["portfolio"]["pnl_realized"]
                 cash = state["portfolio"]["cash_eur"]
                 print(
                     f"[SUMMARY] total_eq=€{eq:.2f} | cash=€{cash:.2f} | pnl_realized=€{pr:.2f} | "
-                    f"day_change={col_start}{day_change:.2f}{col_end}"
+                    f"since_start={col_start}{since_start:.2f}{col_end}"
                 )
                 last_summary_ts = now_ts
 
@@ -372,7 +368,7 @@ def main():
                 t = ex.fetch_ticker(p)
                 px = float(t["last"])
                 grid = state["grids"][p]
-                logs = try_grid_live(ex, p, px, grid["last_price"], grid, state["portfolio"])
+                logs = try_grid_live(ex, p, px, grid["last_price"], grid, state["portfolio"], pairs)
                 if logs:
                     print("\n".join(logs))
 
@@ -380,12 +376,12 @@ def main():
             if time.time() - last_report_ts >= REPORT_EVERY_HOURS * 3600:
                 pr = state["portfolio"]["pnl_realized"]
                 cash = state["portfolio"]["cash_eur"]
-                day_change = eq - CAPITAL_EUR
-                col_start = "\033[92m" if day_change >= 0 else "\033[91m"
+                since_start = eq - CAPITAL_EUR
+                col_start = "\033[92m" if since_start >= 0 else "\033[91m"
                 col_end = "\033[0m"
                 print(
                     f"[REPORT] total_eq=€{eq:.2f} | cash=€{cash:.2f} | pnl_realized=€{pr:.2f} | "
-                    f"day_change={col_start}{day_change:.2f}{col_end} | pairs={pairs}"
+                    f"since_start={col_start}{since_start:.2f}{col_end} | pairs={pairs}"
                 )
                 last_report_ts = time.time()
 
