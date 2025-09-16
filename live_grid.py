@@ -1,6 +1,6 @@
 # live_grid.py
 # --- Multi-coin LIVE grid bot (Bitvavo) ---
-# - Harde capital cap op CAPITAL_EUR
+# - Harde capital cap op CAPITAL_EUR (niet herinvesteren van winst)
 # - Verkoop ALLEEN bij netto winst (MIN_PROFIT_PCT óf MIN_PROFIT_EUR)
 # - CSV logging: data/live_trades.csv, data/live_equity.csv
 # - Console samenvattingen elke LOG_SUMMARY_SEC en rapport elke REPORT_EVERY_HOURS
@@ -236,10 +236,14 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
         for _ in crossed:
             ticket_eur = euro_per_ticket(port["coins"][pair]["cash_alloc"], len(levels))
             exposure = portfolio_exposure_eur(ex, port, pairs_all)
+
+            # buffer-check
             if (port["cash_eur"] - MIN_CASH_BUFFER_EUR) < ticket_eur:
                 logs.append(f"{COL_C}[{pair}] BUY skip: onvoldoende cash (buffer).{COL_RESET}")
                 continue
-            if (port["cash_eur"] + exposure) >= (CAPITAL_EUR - 1e-6):
+
+            # cap-check: blokkeer alleen als som NU al boven cap ligt
+            if (port["cash_eur"] + exposure) > (CAPITAL_EUR + 1e-6):
                 logs.append(f"{COL_C}[{pair}] BUY skip: capital cap bereikt.{COL_RESET}")
                 continue
 
@@ -304,11 +308,7 @@ def main():
     weights = normalize_weights(pairs, WEIGHTS_CSV)
 
     # state laden
-    if STATE_FILE.exists():
-        state = load_json(STATE_FILE, {})
-    else:
-        state = {}
-
+    state = load_json(STATE_FILE, {}) if STATE_FILE.exists() else {}
     if "portfolio" not in state:
         state["portfolio"] = init_portfolio(pairs, weights)
     if "grids" not in state:
