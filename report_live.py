@@ -1,14 +1,13 @@
 # report_live.py — LIVE rapport (spot + short aware)
-# - Leest trades.csv van de live bot
-# - Dagwinst in kleur (groen/rood), 7d/30d samenvatting, per pair
+# - Leest data/live_trades.csv van de live grid bot
+# - Dagwinst in kleur, 7d/30d samenvatting, per pair
 # - Ondersteunt zowel spot-long closes (SELL) als short-closes (SHORT_CLOSE)
 
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import pandas as pd
-import os
 
-TRADES = Path("trades.csv")
+TRADES = Path("data/live_trades.csv")
 
 # ANSI kleuren
 GREEN = "\033[92m"
@@ -19,44 +18,6 @@ RESET = "\033[0m"
 def ts():
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
-def load_trades():
-    cols = [
-        "timestamp","symbol","side","price","amount",
-        "reason","pnl_eur"
-    ]
-    if not TRADES.exists():
-        return pd.DataFrame(columns=cols)
-
-    df = pd.read_csv(TRADES)
-
-    # Normaliseer kolommen
-    for c in ("price","amount","pnl_eur"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        else:
-            df[c] = 0.0
-
-    if "symbol" not in df.columns:
-        df["symbol"] = "?"
-
-    if "side" not in df.columns:
-        df["side"] = ""
-
-    # Datum uit timestamp
-    def to_date(s):
-        try:
-            return pd.to_datetime(s).date()
-        except Exception:
-            return None
-    df["date"] = df["timestamp"].map(to_date)
-
-    # Maak uniforme flags
-    df["is_long_close"]  = df["side"].str.upper().eq("SELL")
-    df["is_short_close"] = df["side"].str.upper().eq("SHORT_CLOSE")
-    df["is_close"]       = df["is_long_close"] | df["is_short_close"]
-
-    return df
-
 def color_amt(eur):
     eur = float(eur or 0.0)
     if eur > 0:
@@ -64,6 +25,53 @@ def color_amt(eur):
     if eur < 0:
         return f"{RED}-€{abs(eur):.2f}{RESET}"
     return f"€{eur:.2f}"
+
+def load_trades():
+    """
+    Normaliseert naar kolommen:
+    timestamp | pair | side | price | amount | pnl_eur
+    Ondersteunt zowel 'avg_price/qty' als 'price/amount'.
+    """
+    cols = ["timestamp","pair","side","price","amount","pnl_eur"]
+    if not TRADES.exists():
+        return pd.DataFrame(columns=cols)
+
+    df = pd.read_csv(TRADES)
+
+    # aliasing van kolomnamen uit live_grid.py
+    if "pair" not in df.columns and "symbol" in df.columns:
+        df.rename(columns={"symbol": "pair"}, inplace=True)
+    if "price" not in df.columns and "avg_price" in df.columns:
+        df.rename(columns={"avg_price": "price"}, inplace=True)
+    if "amount" not in df.columns and "qty" in df.columns:
+        df.rename(columns={"qty": "amount"}, inplace=True)
+    if "pnl_eur" not in df.columns:
+        df["pnl_eur"] = 0.0
+
+    # forceer ontbrekende verplichte kolommen
+    for c in cols:
+        if c not in df.columns:
+            df[c] = "" if c in ("timestamp","pair","side") else 0.0
+
+    # types
+    for c in ("price","amount","pnl_eur"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    # datum
+    def to_date(x):
+        try:
+            return pd.to_datetime(x).date()
+        except Exception:
+            return None
+    df["date"] = df["timestamp"].map(to_date)
+
+    # uniforme flags
+    s = df["side"].astype(str).str.upper()
+    df["is_long_close"]  = s.eq("SELL")
+    df["is_short_close"] = s.eq("SHORT_CLOSE")
+    df["is_close"]       = df["is_long_close"] | df["is_short_close"]
+
+    return df[cols + ["date","is_long_close","is_short_close","is_close"]]
 
 def main():
     print(f"{BOLD}==> LIVE RAPPORT == {ts()}{RESET}")
@@ -73,8 +81,11 @@ def main():
         return
 
     closes = df[df["is_close"]].copy()
+    if closes.empty:
+        print("Nog geen afgesloten posities.")
+        return
 
-    # Laatste 10 dagen (dag → som realized pnl)
+    # Laatste 10 dagen
     today = datetime.now().date()
     days = [today - timedelta(days=i) for i in range(0, 10)]
 
@@ -95,13 +106,13 @@ def main():
 
     # Per pair (totaal)
     print("\n-- Per pair (totaal realized) --")
-    by_pair = closes.groupby("symbol")["pnl_eur"].sum().sort_values(ascending=False)
+    by_pair = closes.groupby("pair", dropna=False)["pnl_eur"].sum().sort_values(ascending=False)
     for pair, pnl in by_pair.items():
+        pair = pair if isinstance(pair, str) and pair else "?"
         print(f"{pair:<10} | pnl= {color_amt(float(pnl))}")
 
     # Split long/short indien aanwezig
-    has_short = closes["is_short_close"].any()
-    if has_short:
+    if closes["is_short_close"].any():
         print("\n-- Uitsplitsing long vs short (totaal realized) --")
         long_pnl  = float(closes[closes["is_long_close"]]["pnl_eur"].sum() or 0.0)
         short_pnl = float(closes[closes["is_short_close"]]["pnl_eur"].sum() or 0.0)
@@ -114,7 +125,7 @@ def main():
         print("\n-- Laatste 10 afsluitingen --")
         for _, r in tail.iterrows():
             dd = r.get("timestamp", "")
-            sym = r.get("symbol", "?")
+            sym = r.get("pair", "?")
             side = r.get("side","")
             px = float(r.get("price",0) or 0)
             amt = float(r.get("amount",0) or 0)
