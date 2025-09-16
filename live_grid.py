@@ -1,11 +1,9 @@
 # live_grid.py
 # --- Multi-coin LIVE grid bot (Bitvavo) ---
 # - Harde cap: SOM(kostprijs open lots) ≤ CAPITAL_EUR
-# - Koopt alleen als er genoeg vrij EUR + fee is (Bitvavo error 216 voorkomen)
-# - Verkoopt ALLEEN bij netto winst (MIN_PROFIT_PCT óf MIN_PROFIT_EUR)
-# - Beschermt bestaande holdings: verkoopt nooit onder baseline per munt
+# - Koopt alleen met voldoende vrij EUR + fee
+# - Verkoopt ALLEEN bij netto winst, en nooit onder baseline van je eigen holdings
 # - CSV logging: data/live_trades.csv, data/live_equity.csv
-# - Console logs met kleur (BUY=cyaan, SELL groen/rood)
 
 import csv
 import json
@@ -20,9 +18,9 @@ import ccxt
 import pandas as pd
 
 # ---------- ANSI kleuren ----------
-COL_G = "\033[92m"   # groen
-COL_R = "\033[91m"   # rood
-COL_C = "\033[96m"   # cyaan (BUY)
+COL_G = "\033[92m"
+COL_R = "\033[91m"
+COL_C = "\033[96m"
 COL_RESET = "\033[0m"
 
 # ---------- helpers ----------
@@ -63,12 +61,13 @@ def free_eur_on_exchange(ex) -> float:
 
 def free_base_on_exchange(ex, base: str) -> float:
     try:
-        bal = ex.fetch_balance().get("free", {})
-        return float(bal.get(base) or 0.0)
+        bal = ex.fetch_balance()
+        free = bal.get("free") or {}
+        return float(free.get(base) or 0.0)
     except Exception:
         return 0.0
 
-# ---------- ENV / Defaults (alfabetisch) ----------
+# ---------- ENV / Defaults ----------
 API_KEY      = os.getenv("API_KEY", "")
 API_SECRET   = os.getenv("API_SECRET", "")
 BAND_PCT     = float(os.getenv("BAND_PCT", "0.20"))
@@ -82,7 +81,7 @@ LOCK_PREEXISTING_BALANCE = os.getenv("LOCK_PREEXISTING_BALANCE","true").lower() 
 LOG_SUMMARY_SEC = int(os.getenv("LOG_SUMMARY_SEC", "240"))
 MIN_CASH_BUFFER_EUR = float(os.getenv("MIN_CASH_BUFFER_EUR", "25"))
 MIN_PROFIT_EUR = float(os.getenv("MIN_PROFIT_EUR", "0.25"))
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.006"))
+MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.005"))
 OPERATOR_ID  = os.getenv("OPERATOR_ID", "").strip()
 ORDER_SIZE_FACTOR = float(os.getenv("ORDER_SIZE_FACTOR", "1.8"))
 REPORT_EVERY_HOURS = float(os.getenv("REPORT_EVERY_HOURS", "4"))
@@ -108,11 +107,7 @@ EQUITY_CSV  = DATA_DIR / "live_equity.csv"
 # ---------- exchange ----------
 def make_exchange():
     klass = getattr(ccxt, EXCHANGE_ID)
-    ex = klass({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "enableRateLimit": True,
-    })
+    ex = klass({"apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True})
     if OPERATOR_ID:
         ex.options["operatorId"] = OPERATOR_ID
     ex.load_markets()
@@ -180,7 +175,7 @@ def init_portfolio(pairs: List[str], weights: Dict[str, float]) -> dict:
 def euro_per_ticket(cash_alloc: float, n_levels: int) -> float:
     if n_levels < 2:
         n_levels = 2
-    base = (cash_alloc * 0.90) / (n_levels // 2)  # 90% alloc in helft van levels
+    base = (cash_alloc * 0.90) / (n_levels // 2)
     return max(5.0, base * ORDER_SIZE_FACTOR)
 
 def mark_to_market(ex, state: dict, pairs: List[str]) -> float:
@@ -212,7 +207,7 @@ def net_gain_ok(buy_price: float, sell_avg: float, fee_pct: float,
 def buy_market(ex, pair: str, eur: float) -> Tuple[float, float, float]:
     if eur < 5.0:
         return 0.0, 0.0, 0.0
-    params = {"cost": float(f"{eur:.2f}")}  # Bitvavo: market buy by quote cost
+    params = {"cost": float(f"{eur:.2f}")}  # Bitvavo: buy by cost
     if OPERATOR_ID:
         params["operatorId"] = OPERATOR_ID
     order = ex.create_order(pair, "market", "buy", None, None, params)
@@ -248,29 +243,21 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
         avail_local = free_eur_on_exchange(ex)
         for _ in crossed:
             ticket_eur_base = euro_per_ticket(port["coins"][pair]["cash_alloc"], len(levels))
-
-            # maximaal te spenderen kost op basis van vrij EUR en fee
             max_cost = max(0.0, avail_local - MIN_CASH_BUFFER_EUR) / (1.0 + FEE_PCT)
             cost = min(ticket_eur_base, max_cost)
-
-            # cost-cap guard
             if invested_cost_eur(state) + cost > CAPITAL_EUR + 1e-6:
                 logs.append(f"{COL_C}[{pair}] BUY skip: cost-cap bereikt.{COL_RESET}")
                 continue
-
             if cost < 5.0:
                 logs.append(f"{COL_C}[{pair}] BUY skip: onvoldoende vrij EUR op exchange.{COL_RESET}")
                 continue
-
             qty, avgp, fee_eur = buy_market(ex, pair, cost)
             if qty <= 0 or avgp <= 0:
                 continue
-
             grid["inventory_lots"].append({"qty": qty, "buy_price": avgp})
             port["cash_eur"] -= (cost + fee_eur)
             port["coins"][pair]["qty"] += qty
-            avail_local -= (cost + fee_eur)  # voorkom dubbele buys boven saldo in dezelfde tick
-
+            avail_local -= (cost + fee_eur)
             append_csv(
                 TRADES_CSV,
                 [now_iso(), pair, "BUY", f"{avgp:.6f}", f"{qty:.8f}", f"{cost:.2f}", f"{port['cash_eur']:.2f}",
@@ -280,29 +267,25 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
             )
             logs.append(f"{COL_C}[{pair}] BUY {qty:.8f} @ €{avgp:.6f} | cost≈€{cost:.2f} | fee≈€{fee_eur:.2f} | cash=€{port['cash_eur']:.2f}{COL_RESET}")
 
-    # SELL: winst-gestuurd per lot + baseline-bescherming
+    # SELL: winst-gestuurd per lot met baseline-protect
     if grid["inventory_lots"]:
         sell_idx = None
         for i, lot in enumerate(grid["inventory_lots"]):
             if net_gain_ok(lot["buy_price"], price_now, FEE_PCT, MIN_PROFIT_PCT, MIN_PROFIT_EUR, lot["qty"]):
                 sell_idx = i
                 break
-
         if sell_idx is not None:
             lot = grid["inventory_lots"][sell_idx]
             qty = lot["qty"]
-
-            # baseline-guard: verkoop nooit onder vooraf gemeten holdings
             base = pair.split("/")[0]
             if LOCK_PREEXISTING_BALANCE and "baseline" in state:
                 free_base = free_base_on_exchange(ex, base)
-                baseline  = float(state["baseline"].get(base, 0.0))
-                bot_free  = max(0.0, free_base - baseline)
+                baseline = float(state["baseline"].get(base, 0.0))
+                bot_free = max(0.0, free_base - baseline)
                 if bot_free + 1e-12 < qty:
                     logs.append(f"[{pair}] SELL skip: baseline-protect ({bot_free:.8f} {base} beschikbaar).")
                     grid["last_price"] = price_now
                     return logs
-
             proceeds, avgp, fee_eur = sell_market(ex, pair, qty)
             if proceeds > 0 and avgp > 0 and net_gain_ok(lot["buy_price"], avgp, FEE_PCT, MIN_PROFIT_PCT, MIN_PROFIT_EUR, qty):
                 grid["inventory_lots"].pop(sell_idx)
@@ -310,17 +293,13 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
                 port["cash_eur"] += (proceeds - fee_eur)
                 port["coins"][pair]["qty"] -= qty
                 port["pnl_realized"] += pnl
-
                 append_csv(
                     TRADES_CSV,
                     [now_iso(), pair, "SELL", f"{avgp:.6f}", f"{qty:.8f}", f"{proceeds:.2f}", f"{port['cash_eur']:.2f}",
                      pair.split("/")[0], f"{port['coins'][pair]['qty']:.8f}", f"{pnl:.2f}", "take_profit"]
                 )
                 col = COL_G if pnl >= 0 else COL_R
-                logs.append(
-                    f"{col}[{pair}] SELL {qty:.8f} @ €{avgp:.6f} | proceeds=€{proceeds:.2f} | fee=€{fee_eur:.2f} "
-                    f"| pnl=€{pnl:.2f} | cash=€{port['cash_eur']:.2f}{COL_RESET}"
-                )
+                logs.append(f"{col}[{pair}] SELL {qty:.8f} @ €{avgp:.6f} | proceeds=€{proceeds:.2f} | fee=€{fee_eur:.2f} | pnl=€{pnl:.2f} | cash=€{port['cash_eur']:.2f}{COL_RESET}")
 
     grid["last_price"] = price_now
     return logs
@@ -344,7 +323,6 @@ def main():
         if p not in state["grids"]:
             state["grids"][p] = mk_grid_state(ex, p, GRID_LEVELS)
 
-    # baseline vastleggen bij start (alleen vrij saldo, per base)
     if LOCK_PREEXISTING_BALANCE and "baseline" not in state:
         bal = ex.fetch_balance().get("free", {})
         state["baseline"] = {p.split("/")[0]: float(bal.get(p.split("/")[0], 0) or 0.0) for p in pairs}
@@ -361,15 +339,10 @@ def main():
 
     while True:
         try:
-            # equity log
             eq = mark_to_market(ex, state, pairs)
-            append_csv(
-                EQUITY_CSV,
-                [datetime.now(timezone.utc).date().isoformat(), f"{eq:.2f}"],
-                header=["date", "total_equity_eur"]
-            )
+            append_csv(EQUITY_CSV, [datetime.now(timezone.utc).date().isoformat(), f"{eq:.2f}"],
+                       header=["date", "total_equity_eur"])
 
-            # korte summary
             now_ts = time.time()
             if now_ts - last_summary_ts >= LOG_SUMMARY_SEC:
                 since_start = eq - CAPITAL_EUR
@@ -377,13 +350,9 @@ def main():
                 pr = state["portfolio"]["pnl_realized"]
                 cash = state["portfolio"]["cash_eur"]
                 inv = invested_cost_eur(state)
-                print(
-                    f"[SUMMARY] total_eq=€{eq:.2f} | cash=€{cash:.2f} | invested_cost=€{inv:.2f} | "
-                    f"pnl_realized=€{pr:.2f} | since_start={col}{since_start:.2f}{COL_RESET}"
-                )
+                print(f"[SUMMARY] total_eq=€{eq:.2f} | cash=€{cash:.2f} | invested_cost=€{inv:.2f} | pnl_realized=€{pr:.2f} | since_start={col}{since_start:.2f}{COL_RESET}")
                 last_summary_ts = now_ts
 
-            # per pair
             for p in pairs:
                 t = ex.fetch_ticker(p)
                 px = float(t["last"])
@@ -392,17 +361,30 @@ def main():
                 if logs:
                     print("\n".join(logs))
 
-            # periodiek report
             if time.time() - last_report_ts >= REPORT_EVERY_HOURS * 3600:
                 pr = state["portfolio"]["pnl_realized"]
                 cash = state["portfolio"]["cash_eur"]
                 inv = invested_cost_eur(state)
                 since_start = eq - CAPITAL_EUR
                 col = COL_G if since_start >= 0 else COL_R
-                print(
-                    f"[REPORT] total_eq=€{eq:.2f} | cash=€{cash:.2f} | invested_cost=€{inv:.2f} | "
-                    f"pnl_realized=€{pr:.2f} | since_start={col}{since_start:.2f}{COL_RESET} | pairs={pairs}"
-                )
+                print(f"[REPORT] total_eq=€{eq:.2f} | cash=€{cash:.2f} | invested_cost=€{inv:.2f} | pnl_realized=€{pr:.2f} | since_start={col}{since_start:.2f}{COL_RESET} | pairs={pairs}")
                 last_report_ts = time.time()
 
             save_json(STATE_FILE, state)
+            time.sleep(SLEEP_SEC)
+
+        except ccxt.NetworkError as e:
+            print(f"[net] {e}; backoff..")
+            time.sleep(2 + random.random())
+        except ccxt.BaseError as e:
+            print(f"[ccxt] {e}; wacht..")
+            time.sleep(5)
+        except KeyboardInterrupt:
+            print("Gestopt.")
+            break
+        except Exception as e:
+            print(f"[runtime] {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
