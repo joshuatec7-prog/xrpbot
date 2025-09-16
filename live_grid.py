@@ -3,6 +3,7 @@
 # - Harde cap: SOM(kostprijs open lots) ≤ CAPITAL_EUR
 # - Koopt alleen als er genoeg vrij EUR + fee is (Bitvavo error 216 voorkomen)
 # - Verkoopt ALLEEN bij netto winst (MIN_PROFIT_PCT óf MIN_PROFIT_EUR)
+# - Beschermt bestaande holdings: verkoopt nooit onder baseline per munt
 # - CSV logging: data/live_trades.csv, data/live_equity.csv
 # - Console logs met kleur (BUY=cyaan, SELL groen/rood)
 
@@ -57,6 +58,13 @@ def free_eur_on_exchange(ex) -> float:
         bal = ex.fetch_balance()
         free = bal.get("free") or {}
         return float(free.get("EUR") or 0.0)
+    except Exception:
+        return 0.0
+
+def free_base_on_exchange(ex, base: str) -> float:
+    try:
+        bal = ex.fetch_balance().get("free", {})
+        return float(bal.get(base) or 0.0)
     except Exception:
         return 0.0
 
@@ -272,7 +280,7 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
             )
             logs.append(f"{COL_C}[{pair}] BUY {qty:.8f} @ €{avgp:.6f} | cost≈€{cost:.2f} | fee≈€{fee_eur:.2f} | cash=€{port['cash_eur']:.2f}{COL_RESET}")
 
-    # SELL: winst-gestuurd per lot
+    # SELL: winst-gestuurd per lot + baseline-bescherming
     if grid["inventory_lots"]:
         sell_idx = None
         for i, lot in enumerate(grid["inventory_lots"]):
@@ -283,6 +291,18 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
         if sell_idx is not None:
             lot = grid["inventory_lots"][sell_idx]
             qty = lot["qty"]
+
+            # baseline-guard: verkoop nooit onder vooraf gemeten holdings
+            base = pair.split("/")[0]
+            if LOCK_PREEXISTING_BALANCE and "baseline" in state:
+                free_base = free_base_on_exchange(ex, base)
+                baseline  = float(state["baseline"].get(base, 0.0))
+                bot_free  = max(0.0, free_base - baseline)
+                if bot_free + 1e-12 < qty:
+                    logs.append(f"[{pair}] SELL skip: baseline-protect ({bot_free:.8f} {base} beschikbaar).")
+                    grid["last_price"] = price_now
+                    return logs
+
             proceeds, avgp, fee_eur = sell_market(ex, pair, qty)
             if proceeds > 0 and avgp > 0 and net_gain_ok(lot["buy_price"], avgp, FEE_PCT, MIN_PROFIT_PCT, MIN_PROFIT_EUR, qty):
                 grid["inventory_lots"].pop(sell_idx)
@@ -324,6 +344,7 @@ def main():
         if p not in state["grids"]:
             state["grids"][p] = mk_grid_state(ex, p, GRID_LEVELS)
 
+    # baseline vastleggen bij start (alleen vrij saldo, per base)
     if LOCK_PREEXISTING_BALANCE and "baseline" not in state:
         bal = ex.fetch_balance().get("free", {})
         state["baseline"] = {p.split("/")[0]: float(bal.get(p.split("/")[0], 0) or 0.0) for p in pairs}
@@ -385,20 +406,3 @@ def main():
                 last_report_ts = time.time()
 
             save_json(STATE_FILE, state)
-            time.sleep(SLEEP_SEC)
-
-        except ccxt.NetworkError as e:
-            print(f"[net] {e}; backoff..")
-            time.sleep(2 + random.random())
-        except ccxt.BaseError as e:
-            print(f"[ccxt] {e}; wacht..")
-            time.sleep(5)
-        except KeyboardInterrupt:
-            print("Gestopt.")
-            break
-        except Exception as e:
-            print(f"[runtime] {e}")
-            time.sleep(5)
-
-if __name__ == "__main__":
-    main()
