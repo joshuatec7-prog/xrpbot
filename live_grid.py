@@ -1,4 +1,10 @@
-# live_grid.py — Bitvavo LIVE grid bot met harde minima + overrides
+# live_grid.py — Bitvavo LIVE grid bot met harde minima + overrides + veilige verkoopmarge
+# - Baseline-protect, cost-cap, live-cap
+# - Minima: €-minimum (quote) + base-minimum per markt, met overrides (XRP/EUR:2)
+# - BUY: cost >= max(min_quote, min_base*price) en naar boven afgerond
+# - SELL: extra veiligheidsmarge tegen slippage (SELL_SAFETY_PCT)
+# - CSV: data/live_trades.csv, data/live_equity.csv
+
 import csv, json, os, random, time, math
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +21,7 @@ def pct(x): return f"{x*100:.2f}%"
 def append_csv(path: Path, row, header=None):
     new = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as f:
-        w=csv.writer(f); 
+        w=csv.writer(f)
         if new and header: w.writerow(header)
         w.writerow(row)
 
@@ -71,12 +77,12 @@ SLEEP_HEARTBEAT_SEC=int(os.getenv("SLEEP_HEARTBEAT_SEC","300"))
 SLEEP_SEC=int(os.getenv("SLEEP_SEC","5"))
 WEIGHTS_CSV=os.getenv("WEIGHTS","BTC/EUR:0.35,ETH/EUR:0.30,SOL/EUR:0.15,XRP/EUR:0.10,LTC/EUR:0.10").strip()
 REINVEST_PROFITS=os.getenv("REINVEST_PROFITS","true").lower() in ("1","true","yes")
+SELL_SAFETY_PCT=float(os.getenv("SELL_SAFETY_PCT","0.002"))  # 0.2% extra marge boven winst+fees
 
 # harde minima
 MIN_QUOTE_EUR=float(os.getenv("MIN_QUOTE_EUR","5"))
-# overrides als CSV "XRP/EUR:2,SOL/EUR:0.06"
 def parse_overrides(s:str)->Dict[str,float]:
-    d={}; 
+    d={}
     for it in [x.strip() for x in s.split(",") if x.strip()]:
         if ":" in it:
             k,v=it.split(":",1)
@@ -173,10 +179,8 @@ def market_mins(ex, pair, price_now:float)->Tuple[float,float]:
     info=m.get("info") or {}
     mc=float(info.get("minOrderInQuoteAsset") or 0) or 0.0
     ma=float(info.get("minOrderInBaseAsset") or 0) or 0.0
-    # apply overrides
     min_amt = max(min_amt, ma, MIN_BASE_OVERRIDES.get(pair, 0.0))
     min_cost = max(min_cost, mc, MIN_QUOTE_EUR)
-    # last resort: derive a bit higher than min quote
     if min_amt<=0 and price_now>0: min_amt = (min_cost/price_now)*1.02
     return float(min_cost), float(min_amt)
 
@@ -226,10 +230,8 @@ def try_grid_live(ex, pair, price_now, price_prev, state, grid, pairs)->List[str
             min_quote, min_base = market_mins(ex, pair, price_now)
             required=max(min_quote, (min_base*price_now))
             cost=max(cost, required)
-            cost=math.ceil(cost)  # altijd erboven
-
-            # na fee nog steeds boven minima: voeg 1% marge toe
-            cost = math.ceil(cost*1.01)
+            cost=math.ceil(cost)                      # altijd erboven
+            cost=math.ceil(cost*1.01)                 # +1% marge
 
             if invested_cost_eur(state)+cost>cap+1e-6:
                 logs.append(f"{COL_C}[{pair}] BUY skip: cost-cap (cap=€{cap:.2f}).{COL_RESET}"); continue
@@ -239,7 +241,6 @@ def try_grid_live(ex, pair, price_now, price_prev, state, grid, pairs)->List[str
             qty,avg,fee,executed=buy_market(ex,pair,cost)
             if qty<=0 or avg<=0: continue
 
-            # guard: controleer dat fill ook minima haalt
             if qty<min_base or executed<min_quote:
                 logs.append(f"{COL_C}[{pair}] BUY fill < minima (amt={qty:.8f} < {min_base} of €{executed:.2f} < €{min_quote:.2f}); overslaan.{COL_RESET}")
                 continue
@@ -276,6 +277,12 @@ def try_grid_live(ex, pair, price_now, price_prev, state, grid, pairs)->List[str
                 break
             if bot_free is not None and bot_free+1e-12<qty:
                 logs.append(f"[{pair}] SELL stop: baseline-protect ({bot_free:.8f} {base} beschikbaar).")
+                break
+
+            # veilige triggerprijs: winst + 2*fee + safety
+            trigger_px = lot["buy_price"] * (1.0 + MIN_PROFIT_PCT + 2.0*FEE_PCT + SELL_SAFETY_PCT)
+            if price_now + 1e-12 < trigger_px:
+                logs.append(f"[{pair}] SELL wait: px €{price_now:.2f} < trigger €{trigger_px:.2f}.")
                 break
 
             proceeds,avg,fee=sell_market(ex,pair,qty)
@@ -315,7 +322,8 @@ def main():
     save_json(STATE_FILE,state)
 
     print(f"== LIVE GRID start | capital=€{CAPITAL_EUR:.2f} | levels={GRID_LEVELS} | fee={pct(FEE_PCT)} | "
-          f"pairs={pairs} | factor={ORDER_SIZE_FACTOR} | min_profit={pct(MIN_PROFIT_PCT)} / €{MIN_PROFIT_EUR:.2f}")
+          f"pairs={pairs} | factor={ORDER_SIZE_FACTOR} | min_profit={pct(MIN_PROFIT_PCT)} / €{MIN_PROFIT_EUR:.2f} | "
+          f"sell_safety={pct(SELL_SAFETY_PCT)}")
 
     last_report=0.0; last_sum=0.0
     while True:
