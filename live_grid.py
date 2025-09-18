@@ -1,10 +1,9 @@
-# live_grid.py — Bitvavo LIVE grid bot (snelle variant + minima-fix)
-# - Baseline-protect: verkoop alleen boven startvoorraad (of zet LOCK_PREEXISTING_BALANCE=false)
-# - Cost-cap + live-cap: totale inzet boven baseline ≤ cap_now(state)
-# - Minima-fix: BUY voldoet aan min € én min base-qty; SELL slaat te kleine lots over
-# - Multi-sell: verkoop alle winstgevende lots zolang baseline dit toelaat
-# - Hele-euro cost; logging met executed cost (fill)
-# - CSV: data/live_trades.csv, data/live_equity.csv
+# live_grid.py — Bitvavo LIVE grid bot (minima hard gefixed)
+# - Baseline-protect, cost-cap, live-cap
+# - Minima: leest minOrderInQuoteAsset én minOrderInBaseAsset uit market.info
+# - BUY: cost >= max(min_quote, min_base*price) + marge
+# - SELL: slaat lots over als qty < min_base of (qty*price) < min_quote
+# - Multi-sell, hele-euro cost, executed-cost logging, snelle polling
 
 import csv, json, os, random, time, math
 from datetime import datetime, timezone
@@ -19,7 +18,7 @@ COL_G="\033[92m"; COL_R="\033[91m"; COL_C="\033[96m"; COL_RESET="\033[0m"
 def now_iso() -> str: return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 def pct(x: float) -> str: return f"{x*100:.2f}%"
 
-def append_csv(path: Path, row: List[str], header: List[str] | None = None):
+def append_csv(path: Path, row, header=None):
     new = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -170,12 +169,30 @@ def invested_cost_eur(state: dict) -> float:
     return tot
 
 # ---------- minima ----------
-def market_mins(ex, pair: str) -> Tuple[float, float]:
+def _to_float(x):
+    try: return float(x)
+    except Exception: return None
+
+def market_mins(ex, pair: str, price_now: float | None = None) -> Tuple[float, float]:
+    """Return (min_quote_eur, min_base_qty) with Bitvavo fallbacks."""
     m = ex.markets.get(pair, {}) or {}
     lim = (m.get("limits") or {})
-    min_cost = float((lim.get("cost") or {}).get("min") or 5.0)   # min in quote (EUR)
-    min_amt  = float((lim.get("amount") or {}).get("min") or 0.0) # min in base
-    return min_cost, min_amt
+    min_cost = _to_float((lim.get("cost") or {}).get("min"))
+    min_amt  = _to_float((lim.get("amount") or {}).get("min"))
+    info = (m.get("info") or {})
+    mc_info = _to_float(info.get("minOrderInQuoteAsset"))
+    ma_info = _to_float(info.get("minOrderInBaseAsset"))
+    if not min_cost or min_cost <= 0: min_cost = mc_info if mc_info and mc_info > 0 else 5.0
+    if not min_amt  or min_amt  <= 0:
+        if ma_info and ma_info > 0:
+            min_amt = ma_info
+        else:
+            # afleiding uit min_quote / prijs als laatste redmiddel
+            if price_now and price_now > 0:
+                min_amt = min_cost / price_now
+            else:
+                min_amt = 0.0
+    return float(min_cost), float(min_amt)
 
 # ---------- winst en fills ----------
 def net_gain_ok(buy_price: float, sell_avg: float, fee_pct: float, min_pct: float, min_eur: float, qty: float) -> bool:
@@ -217,24 +234,23 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float, state: dic
         inv_live_cap = bot_inventory_value_eur_from_exchange(ex, state, pairs_all)
         cap = cap_now(state)
         for _ in crossed:
-            # ticket en vrij EUR
             ticket = euro_per_ticket(port["coins"][pair]["cash_alloc"], len(levels))
             max_cost = max(0.0, avail_local - MIN_CASH_BUFFER_EUR) / (1.0 + FEE_PCT)
             cost = min(ticket, max_cost)
 
-            # afdwingen Bitvavo-minima
-            min_cost, min_amt = market_mins(ex, pair)
-            required_by_amt = (min_amt * price_now) * 1.02  # 2% marge
-            cost = max(cost, min_cost, required_by_amt)
-            cost = math.floor(cost)  # hele euro
+            min_quote, min_base = market_mins(ex, pair, price_now)
+            # marge 2% + naar boven afronden
+            required = max(min_quote, (min_base * price_now) * 1.02)
+            cost = max(cost, required)
+            cost = math.ceil(cost)   # nooit onder minimum
 
-            if cost < max(5.0, min_cost):
-                logs.append(f"{COL_C}[{pair}] BUY skip: order < minima (cost≥€{max(5.0,min_cost):.2f}, amt≥{min_amt}).{COL_RESET}")
+            if cost < max(5.0, min_quote):
+                logs.append(f"{COL_C}[{pair}] BUY skip: order < minima (€≥{max(5.0,min_quote):.2f}, base≥{min_base}).{COL_RESET}")
                 continue
             if invested_cost_eur(state) + cost > cap + 1e-6:
-                logs.append(f"{COL_C}[{pair}] BUY skip: cost-cap bereikt (cap=€{cap:.2f}).{COL_RESET}"); continue
+                logs.append(f"{COL_C}[{pair}] BUY skip: cost-cap (cap=€{cap:.2f}).{COL_RESET}"); continue
             if inv_live_cap + cost > cap + 1e-6:
-                logs.append(f"{COL_C}[{pair}] BUY skip: live-cap bereikt (≈€{inv_live_cap:.2f}/{cap:.2f}).{COL_RESET}"); continue
+                logs.append(f"{COL_C}[{pair}] BUY skip: live-cap (≈€{inv_live_cap:.2f}/{cap:.2f}).{COL_RESET}"); continue
 
             qty, avgp, fee_eur, executed = buy_market(ex, pair, cost)
             if qty <= 0 or avgp <= 0: continue
@@ -250,7 +266,7 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float, state: dic
                 header=["timestamp","pair","side","avg_price","qty","eur","cash_eur","base","base_qty","pnl_eur","comment"])
             logs.append(f"{COL_C}[{pair}] BUY {qty:.8f} @ €{avgp:.6f} | req=€{cost:.2f} | exec≈€{executed:.2f} | fee≈€{fee_eur:.2f} | cash=€{port['cash_eur']:.2f}{COL_RESET}")
 
-    # SELL (multi-sell, met min_amt en baseline)
+    # SELL (multi-sell + minima + baseline)
     if grid["inventory_lots"]:
         base = pair.split("/")[0]
         bot_free_avail = None
@@ -267,10 +283,12 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float, state: dic
             if idx is None: break
             lot = grid["inventory_lots"][idx]; qty = lot["qty"]
 
-            # min base-qty voor verkoop
-            _, min_amt = market_mins(ex, pair)
-            if qty + 1e-12 < min_amt:
-                logs.append(f"[{pair}] SELL skip: lot {qty:.8f} < min_amt {min_amt}.")
+            min_quote, min_base = market_mins(ex, pair, price_now)
+            if qty + 1e-12 < min_base:
+                logs.append(f"[{pair}] SELL skip: lot {qty:.8f} < min_base {min_base}.")
+                break
+            if (qty * price_now) + 1e-9 < min_quote * 1.00:   # 0% marge, we zaten al boven minima bij BUY
+                logs.append(f"[{pair}] SELL skip: value €{qty*price_now:.2f} < min_quote €{min_quote:.2f}.")
                 break
 
             if bot_free_avail is not None and bot_free_avail + 1e-12 < qty:
