@@ -12,6 +12,7 @@ import json
 import os
 import random
 import time
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -32,8 +33,9 @@ def pct(x: float) -> str:
 def append_csv(path: Path, row: List[str], header: List[str] | None = None):
     new = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f); 
-        if new and header: w.writerow(header)
+        w = csv.writer(f)
+        if new and header:
+            w.writerow(header)
         w.writerow(row)
 
 def load_json(path: Path, default):
@@ -105,7 +107,7 @@ WEIGHTS_CSV   = os.getenv("WEIGHTS","BTC/EUR:0.35,ETH/EUR:0.30,SOL/EUR:0.15,XRP/
 REINVEST_PROFITS = os.getenv("REINVEST_PROFITS","true").lower() in ("1","true","yes")
 
 def cap_now(state) -> float:
-    """Dynamische cap: met herinvesteren = CAPITAL_EUR; zonder = CAPITAL_EUR - pnl_realized, begrensd [0, CAPITAL_EUR]."""
+    """Dynamische cap: met herinvesteren = CAPITAL_EUR; zonder = CAPITAL_EUR - pnl_realized."""
     pnl = float(state.get("portfolio", {}).get("pnl_realized", 0.0))
     if REINVEST_PROFITS:
         return CAPITAL_EUR
@@ -205,15 +207,17 @@ def net_gain_ok(buy_price: float, sell_avg: float, fee_pct: float,
     net_eur   = (sell_avg - buy_price) * qty - (sell_avg * qty) * fee_pct - (buy_price * qty) * fee_pct
     return (net_pct >= min_pct) or (net_eur >= min_eur)
 
-def buy_market(ex, pair: str, eur: float) -> Tuple[float, float, float]:
-    if eur < 5.0: return 0.0, 0.0, 0.0
-    params = {"cost": float(f"{eur:.2f}")}; 
+def buy_market(ex, pair: str, eur: float) -> Tuple[float, float, float, float]:
+    """Koop by-cost. Return (filled_qty, avg_price, fee_eur≈executed*fee, executed_eur)."""
+    if eur < 5.0: return 0.0, 0.0, 0.0, 0.0
+    params = {"cost": float(f"{eur:.2f}")}  # Bitvavo: buy by cost
     if OPERATOR_ID: params["operatorId"] = OPERATOR_ID
     order = ex.create_order(pair, "market", "buy", None, None, params)
     avgp = float(order.get("average") or order.get("price") or 0.0)
     filled = float(order.get("filled") or order.get("info", {}).get("filledAmount") or 0.0)
-    fee_eur = eur * FEE_PCT
-    return filled, avgp, fee_eur
+    executed = avgp * filled
+    fee_eur = executed * FEE_PCT
+    return filled, avgp, fee_eur, executed
 
 def sell_market(ex, pair: str, qty: float) -> Tuple[float, float, float]:
     if qty <= 0: return 0.0, 0.0, 0.0
@@ -238,8 +242,10 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
         cap = cap_now(state)
         for _ in crossed:
             ticket_eur_base = euro_per_ticket(port["coins"][pair]["cash_alloc"], len(levels))
+            # vrij EUR incl fee; afronden naar hele euro voor submit
             max_cost = max(0.0, avail_local - MIN_CASH_BUFFER_EUR) / (1.0 + FEE_PCT)
             cost = min(ticket_eur_base, max_cost)
+            cost = math.floor(cost)  # hele euro zoals Bitvavo afrondt
 
             if invested_cost_eur(state) + cost > cap + 1e-6:
                 logs.append(f"{COL_C}[{pair}] BUY skip: cost-cap bereikt (cap=€{cap:.2f}).{COL_RESET}")
@@ -251,19 +257,19 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float,
                 logs.append(f"{COL_C}[{pair}] BUY skip: onvoldoende vrij EUR op exchange.{COL_RESET}")
                 continue
 
-            qty, avgp, fee_eur = buy_market(ex, pair, cost)
+            qty, avgp, fee_eur, executed = buy_market(ex, pair, cost)
             if qty <= 0 or avgp <= 0: continue
 
             grid["inventory_lots"].append({"qty": qty, "buy_price": avgp})
-            port["cash_eur"] -= (cost + fee_eur)
+            port["cash_eur"] -= (executed + fee_eur)
             port["coins"][pair]["qty"] += qty
-            avail_local -= (cost + fee_eur); inv_live_cap += cost
+            avail_local -= (executed + fee_eur); inv_live_cap += executed
 
             append_csv(TRADES_CSV,
-                [now_iso(), pair, "BUY", f"{avgp:.6f}", f"{qty:.8f}", f"{cost:.2f}", f"{port['cash_eur']:.2f}",
+                [now_iso(), pair, "BUY", f"{avgp:.6f}", f"{qty:.8f}", f"{executed:.2f}", f"{port['cash_eur']:.2f}",
                  pair.split("/")[0], f"{port['coins'][pair]['qty']:.8f}", "", "grid_buy"],
                 header=["timestamp","pair","side","avg_price","qty","eur","cash_eur","base","base_qty","pnl_eur","comment"])
-            logs.append(f"{COL_C}[{pair}] BUY {qty:.8f} @ €{avgp:.6f} | cost≈€{cost:.2f} | fee≈€{fee_eur:.2f} | cash=€{port['cash_eur']:.2f}{COL_RESET}")
+            logs.append(f"{COL_C}[{pair}] BUY {qty:.8f} @ €{avgp:.6f} | requested=€{cost:.2f} | executed≈€{executed:.2f} | fee≈€{fee_eur:.2f} | cash=€{port['cash_eur']:.2f}{COL_RESET}")
 
     # SELL met baseline-protect
     if grid["inventory_lots"]:
