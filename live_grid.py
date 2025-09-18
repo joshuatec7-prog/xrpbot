@@ -1,9 +1,10 @@
-# live_grid.py — snellere variant
-# - 15m band; meer levels via ENV
-# - Multi-sell: verkoop alle winstgevende lots (baseline-beschermd)
-# - Live-cap + cost-cap + baseline-protect
-# - Hele-euro cost, executed-cost logging
-# - REINVEST_PROFITS cap
+# live_grid.py — Bitvavo LIVE grid bot (snelle variant + minima-fix)
+# - Baseline-protect: verkoop alleen boven startvoorraad (of zet LOCK_PREEXISTING_BALANCE=false)
+# - Cost-cap + live-cap: totale inzet boven baseline ≤ cap_now(state)
+# - Minima-fix: BUY voldoet aan min € én min base-qty; SELL slaat te kleine lots over
+# - Multi-sell: verkoop alle winstgevende lots zolang baseline dit toelaat
+# - Hele-euro cost; logging met executed cost (fill)
+# - CSV: data/live_trades.csv, data/live_equity.csv
 
 import csv, json, os, random, time, math
 from datetime import datetime, timezone
@@ -71,17 +72,17 @@ COINS_CSV    = os.getenv("COINS","BTC/EUR,ETH/EUR,SOL/EUR,XRP/EUR,LTC/EUR").stri
 DATA_DIR_ARG = os.getenv("DATA_DIR","data")
 EXCHANGE_ID  = os.getenv("EXCHANGE","bitvavo").strip().lower()
 FEE_PCT      = float(os.getenv("FEE_PCT","0.0015"))
-GRID_LEVELS  = int(os.getenv("GRID_LEVELS","48"))           # dichter grid
+GRID_LEVELS  = int(os.getenv("GRID_LEVELS","48"))
 LOCK_PREEXISTING_BALANCE = os.getenv("LOCK_PREEXISTING_BALANCE","true").lower() in ("1","true","yes")
 LOG_SUMMARY_SEC = int(os.getenv("LOG_SUMMARY_SEC","240"))
 MIN_CASH_BUFFER_EUR = float(os.getenv("MIN_CASH_BUFFER_EUR","25"))
-MIN_PROFIT_EUR = float(os.getenv("MIN_PROFIT_EUR","0.10"))   # sneller winstnemen
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT","0.001"))  # 0.10% netto
+MIN_PROFIT_EUR = float(os.getenv("MIN_PROFIT_EUR","0.10"))
+MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT","0.001"))
 OPERATOR_ID  = os.getenv("OPERATOR_ID","").strip()
-ORDER_SIZE_FACTOR = float(os.getenv("ORDER_SIZE_FACTOR","1.2"))  # kleinere tickets
+ORDER_SIZE_FACTOR = float(os.getenv("ORDER_SIZE_FACTOR","1.2"))
 REPORT_EVERY_HOURS = float(os.getenv("REPORT_EVERY_HOURS","4"))
 SLEEP_HEARTBEAT_SEC = int(os.getenv("SLEEP_HEARTBEAT_SEC","300"))
-SLEEP_SEC     = int(os.getenv("SLEEP_SEC","5"))              # sneller pollen
+SLEEP_SEC     = int(os.getenv("SLEEP_SEC","5"))
 WEIGHTS_CSV   = os.getenv("WEIGHTS","BTC/EUR:0.35,ETH/EUR:0.30,SOL/EUR:0.15,XRP/EUR:0.10,LTC/EUR:0.10").strip()
 REINVEST_PROFITS = os.getenv("REINVEST_PROFITS","true").lower() in ("1","true","yes")
 
@@ -129,13 +130,11 @@ def geometric_levels(low: float, high: float, n: int) -> List[float]:
     return [low*(r**i) for i in range(n)]
 
 def compute_band_from_history(ex, pair: str) -> Tuple[float, float]:
-    # snellere band: 15m data, ~14d; fallback ±BAND_PCT
     try:
         ohlcv = ex.fetch_ohlcv(pair, timeframe="15m", limit=4*24*14)
         if ohlcv and len(ohlcv) >= 100:
             closes = [c[4] for c in ohlcv if c and c[4] is not None]
-            s = pd.Series(closes)
-            p10 = float(s.quantile(0.10)); p90 = float(s.quantile(0.90))
+            s = pd.Series(closes); p10 = float(s.quantile(0.10)); p90 = float(s.quantile(0.90))
             if p90 > p10 > 0: return p10, p90
     except Exception: pass
     last = float(ex.fetch_ticker(pair)["last"])
@@ -170,6 +169,14 @@ def invested_cost_eur(state: dict) -> float:
         for lot in g["inventory_lots"]: tot += lot["qty"] * lot["buy_price"]
     return tot
 
+# ---------- minima ----------
+def market_mins(ex, pair: str) -> Tuple[float, float]:
+    m = ex.markets.get(pair, {}) or {}
+    lim = (m.get("limits") or {})
+    min_cost = float((lim.get("cost") or {}).get("min") or 5.0)   # min in quote (EUR)
+    min_amt  = float((lim.get("amount") or {}).get("min") or 0.0) # min in base
+    return min_cost, min_amt
+
 # ---------- winst en fills ----------
 def net_gain_ok(buy_price: float, sell_avg: float, fee_pct: float, min_pct: float, min_eur: float, qty: float) -> bool:
     if buy_price <= 0 or sell_avg <= 0 or qty <= 0: return False
@@ -203,23 +210,31 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float, state: dic
     levels = grid["levels"]; port = state["portfolio"]; logs: List[str] = []
     if not levels: return logs
 
-    # BUY: neerwaartse cross → koop als caps en vrij EUR het toelaten
+    # BUY
     if price_prev is not None and price_now < price_prev:
         crossed = [L for L in levels if price_now < L <= price_prev]
         avail_local = free_eur_on_exchange(ex)
         inv_live_cap = bot_inventory_value_eur_from_exchange(ex, state, pairs_all)
         cap = cap_now(state)
         for _ in crossed:
+            # ticket en vrij EUR
             ticket = euro_per_ticket(port["coins"][pair]["cash_alloc"], len(levels))
             max_cost = max(0.0, avail_local - MIN_CASH_BUFFER_EUR) / (1.0 + FEE_PCT)
-            cost = math.floor(min(ticket, max_cost))  # hele euro
+            cost = min(ticket, max_cost)
 
+            # afdwingen Bitvavo-minima
+            min_cost, min_amt = market_mins(ex, pair)
+            required_by_amt = (min_amt * price_now) * 1.02  # 2% marge
+            cost = max(cost, min_cost, required_by_amt)
+            cost = math.floor(cost)  # hele euro
+
+            if cost < max(5.0, min_cost):
+                logs.append(f"{COL_C}[{pair}] BUY skip: order < minima (cost≥€{max(5.0,min_cost):.2f}, amt≥{min_amt}).{COL_RESET}")
+                continue
             if invested_cost_eur(state) + cost > cap + 1e-6:
                 logs.append(f"{COL_C}[{pair}] BUY skip: cost-cap bereikt (cap=€{cap:.2f}).{COL_RESET}"); continue
             if inv_live_cap + cost > cap + 1e-6:
                 logs.append(f"{COL_C}[{pair}] BUY skip: live-cap bereikt (≈€{inv_live_cap:.2f}/{cap:.2f}).{COL_RESET}"); continue
-            if cost < 5.0:
-                logs.append(f"{COL_C}[{pair}] BUY skip: onvoldoende vrij EUR op exchange.{COL_RESET}"); continue
 
             qty, avgp, fee_eur, executed = buy_market(ex, pair, cost)
             if qty <= 0 or avgp <= 0: continue
@@ -235,7 +250,7 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float, state: dic
                 header=["timestamp","pair","side","avg_price","qty","eur","cash_eur","base","base_qty","pnl_eur","comment"])
             logs.append(f"{COL_C}[{pair}] BUY {qty:.8f} @ €{avgp:.6f} | req=€{cost:.2f} | exec≈€{executed:.2f} | fee≈€{fee_eur:.2f} | cash=€{port['cash_eur']:.2f}{COL_RESET}")
 
-    # SELL: verkoop ALLE winstgevende lots binnen baseline-limiet
+    # SELL (multi-sell, met min_amt en baseline)
     if grid["inventory_lots"]:
         base = pair.split("/")[0]
         bot_free_avail = None
@@ -247,11 +262,16 @@ def try_grid_live(ex, pair: str, price_now: float, price_prev: float, state: dic
         sold_any = True
         while sold_any and grid["inventory_lots"]:
             sold_any = False
-            # vind eerste winstgevende lot
             idx = next((i for i,l in enumerate(grid["inventory_lots"])
                         if net_gain_ok(l["buy_price"], price_now, FEE_PCT, MIN_PROFIT_PCT, MIN_PROFIT_EUR, l["qty"])), None)
             if idx is None: break
             lot = grid["inventory_lots"][idx]; qty = lot["qty"]
+
+            # min base-qty voor verkoop
+            _, min_amt = market_mins(ex, pair)
+            if qty + 1e-12 < min_amt:
+                logs.append(f"[{pair}] SELL skip: lot {qty:.8f} < min_amt {min_amt}.")
+                break
 
             if bot_free_avail is not None and bot_free_avail + 1e-12 < qty:
                 logs.append(f"[{pair}] SELL stop: baseline-protect ({bot_free_avail:.8f} {base} beschikbaar).")
@@ -347,3 +367,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
