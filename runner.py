@@ -1,4 +1,4 @@
-# runner.py — start live_grid.py en maak periodieke rapporten
+# runner.py — start live_grid.py en maak periodiek een rapport
 import os, time, sys, subprocess, csv
 from pathlib import Path
 
@@ -7,24 +7,19 @@ SLEEP_HEARTBEAT_SEC = int(os.getenv("SLEEP_HEARTBEAT_SEC","300"))
 DATA_DIR = Path(os.getenv("DATA_DIR","data"))
 EQUITY_CSV = DATA_DIR / "live_equity.csv"
 
-def latest_equity() -> str:
+def latest_equity():
     try:
-        if not EQUITY_CSV.exists():
-            return "n/a"
+        if not EQUITY_CSV.exists(): return "n/a"
         last = None
         with EQUITY_CSV.open("r", encoding="utf-8") as f:
-            rdr = csv.reader(f)
-            for row in rdr:
-                if row and len(row) >= 2:
-                    last = row
-        if last is None:
-            return "n/a"
-        return f"{float(last[1]):.2f}".replace(".", ",")
+            for row in csv.reader(f):
+                if row and len(row) >= 2: last = row
+        return "n/a" if last is None else f"{float(last[1]):.2f}".replace(".",",")
     except Exception:
         return "n/a"
 
 def start_grid():
-    print("[runner] start live_grid.py …", flush=True)
+    print("[runner] start: live_grid.py", flush=True)
     return subprocess.Popen([sys.executable, "-u", "live_grid.py"])
 
 def run_report_once():
@@ -38,7 +33,6 @@ def run_report_once():
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     grid = start_grid()
-
     last_report_ts = 0.0
     run_report_once()
     last_report_ts = time.time()
@@ -50,8 +44,7 @@ def main():
                 time.sleep(2)
                 grid = start_grid()
 
-            eq = latest_equity()
-            print(f"[runner] Heartbeat → Equity: €{eq}", flush=True)
+            print(f"[runner] Heartbeat → Equity: €{latest_equity()}", flush=True)
 
             if (time.time() - last_report_ts) >= REPORT_EVERY_HOURS * 3600:
                 run_report_once()
