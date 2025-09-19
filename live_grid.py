@@ -1,9 +1,7 @@
-# live_grid.py — Bitvavo LIVE grid bot met harde minima + sell-safety op best bid
-# - Baseline-protect, cost-cap, live-cap
-# - Minima: €-minimum (quote) + base-minimum per markt, met overrides (XRP/EUR:2)
-# - BUY: cost >= max(min_quote, min_base*price) en naar boven afgerond
-# - SELL: check op BEST BID met extra veiligheidsmarge (SELL_SAFETY_PCT) tegen slippage
-# - Precision-fix bij SELL (amount_to_precision)
+# live_grid.py — Bitvavo LIVE grid bot met harde minima + veilige sells
+# - Baseline protect, cost-cap, live-cap
+# - Minima: quote-min en base-min (incl. overrides), afgerond naar boven
+# - SELL alleen bij netto winst, getoetst op best bid + veiligheidsmarge
 # - CSV: data/live_trades.csv, data/live_equity.csv
 
 import csv, json, os, random, time, math
@@ -68,20 +66,19 @@ FEE_PCT=float(os.getenv("FEE_PCT","0.0015"))
 GRID_LEVELS=int(os.getenv("GRID_LEVELS","48"))
 LOCK_PREEXISTING_BALANCE=os.getenv("LOCK_PREEXISTING_BALANCE","true").lower() in ("1","true","yes")
 LOG_SUMMARY_SEC=int(os.getenv("LOG_SUMMARY_SEC","240"))
-MIN_CASH_BUFFER_EUR=float(os.getenv("MIN_CASH_BUFFER_EUR","25"))
+MIN_CASH_BUFFER_EUR=float(os.getenv("MIN_CASH_BUFFER_EUR","10"))
 MIN_PROFIT_EUR=float(os.getenv("MIN_PROFIT_EUR","0.10"))
 MIN_PROFIT_PCT=float(os.getenv("MIN_PROFIT_PCT","0.001"))
-OPERATOR_ID=os.getenv("OPERATOR_ID","").strip()
-ORDER_SIZE_FACTOR=float(os.getenv("ORDER_SIZE_FACTOR","1.2"))
-REPORT_EVERY_HOURS=float(os.getenv("REPORT_EVERY_HOURS","4"))
-SLEEP_HEARTBEAT_SEC=int(os.getenv("SLEEP_HEARTBEAT_SEC","300"))
-SLEEP_SEC=int(os.getenv("SLEEP_SEC","5"))
-WEIGHTS_CSV=os.getenv("WEIGHTS","BTC/EUR:0.35,ETH/EUR:0.30,SOL/EUR:0.15,XRP/EUR:0.10,LTC/EUR:0.10").strip()
-REINVEST_PROFITS=os.getenv("REINVEST_PROFITS","true").lower() in ("1","true","yes")
-SELL_SAFETY_PCT=float(os.getenv("SELL_SAFETY_PCT","0.010"))  # 1.0% extra boven winst+fees
-
-# minima
 MIN_QUOTE_EUR=float(os.getenv("MIN_QUOTE_EUR","5"))
+OPERATOR_ID=os.getenv("OPERATOR_ID","").strip()
+ORDER_SIZE_FACTOR=float(os.getenv("ORDER_SIZE_FACTOR","1.6"))
+REINVEST_PROFITS=os.getenv("REINVEST_PROFITS","true").lower() in ("1","true","yes")
+REPORT_EVERY_HOURS=float(os.getenv("REPORT_EVERY_HOURS","4"))
+SELL_SAFETY_PCT=float(os.getenv("SELL_SAFETY_PCT","0.006"))
+SLEEP_HEARTBEAT_SEC=int(os.getenv("SLEEP_HEARTBEAT_SEC","300"))
+SLEEP_SEC=int(os.getenv("SLEEP_SEC","3"))
+WEIGHTS_CSV=os.getenv("WEIGHTS","BTC/EUR:0.45,ETH/EUR:0.20,SOL/EUR:0.25,XRP/EUR:0.05,LTC/EUR:0.05").strip()
+
 def parse_overrides(s:str)->Dict[str,float]:
     d={}
     for it in [x.strip() for x in s.split(",") if x.strip()]:
@@ -245,8 +242,8 @@ def try_grid_live(ex, pair, price_now, price_prev, state, grid, pairs)->List[str
             min_quote, min_base = market_mins(ex, pair, price_now)
             required=max(min_quote, (min_base*price_now))
             cost=max(cost, required)
-            cost=math.ceil(cost)           # altijd erboven
-            cost=math.ceil(cost*1.01)      # +1%
+            cost=math.ceil(cost)          # erboven
+            cost=math.ceil(cost*1.01)     # +1%
 
             if invested_cost_eur(state)+cost>cap+1e-6:
                 logs.append(f"{COL_C}[{pair}] BUY skip: cost-cap (cap=€{cap:.2f}).{COL_RESET}"); continue
@@ -288,24 +285,22 @@ def try_grid_live(ex, pair, price_now, price_prev, state, grid, pairs)->List[str
             lot=grid["inventory_lots"][idx]
             qty=lot["qty"]
 
-            # minima
             if qty<min_base or (qty*price_now)<min_quote:
                 logs.append(f"[{pair}] SELL skip: lot te klein (amt {qty:.8f} / min {min_base} of €{qty*price_now:.2f} / min €{min_quote:.2f}).")
                 break
 
-            # baseline
             if bot_free is not None and bot_free+1e-12<qty:
                 logs.append(f"[{pair}] SELL stop: baseline-protect ({bot_free:.8f} {base} beschikbaar).")
                 break
 
-            # drempel op BEST BID
             bid_px = best_bid_px(ex, pair)
             trigger_px = lot["buy_price"] * (1.0 + MIN_PROFIT_PCT + 2.0*FEE_PCT + SELL_SAFETY_PCT)
             if bid_px + 1e-12 < trigger_px:
                 logs.append(f"[{pair}] SELL wait: bid €{bid_px:.2f} < trigger €{trigger_px:.2f}.")
                 break
 
-            sell_qty = amount_to_precision(ex, pair, qty)
+            sell_qty = ex.amount_to_precision(pair, qty)
+            sell_qty = float(sell_qty)
             if sell_qty<=0 or sell_qty + 1e-15 < min_base:
                 logs.append(f"[{pair}] SELL skip: qty {sell_qty:.8f} < min {min_base}.")
                 break
