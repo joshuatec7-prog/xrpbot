@@ -1,34 +1,41 @@
-# report_live.py — LIVE rapport (spot + short aware)
+# report_live.py — LIVE rapport
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import pandas as pd
 
 TRADES = Path("data/live_trades.csv")
 
-GREEN = "\033[92m"; RED = "\033[91m"; BOLD = "\033[1m"; RESET = "\033[0m"
+GREEN="\033[92m"; RED="\033[91m"; BOLD="\033[1m"; RESET="\033[0m"
 
-def ts(): return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+def ts():
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 def color_amt(eur):
     eur = float(eur or 0.0)
-    if eur > 0:  return f"{GREEN}+€{eur:.2f}{RESET}"
-    if eur < 0:  return f"{RED}-€{abs(eur):.2f}{RESET}"
+    if eur > 0: return f"{GREEN}+€{eur:.2f}{RESET}"
+    if eur < 0: return f"{RED}-€{abs(eur):.2f}{RESET}"
     return f"€{eur:.2f}"
 
 def load_trades():
     cols = ["timestamp","pair","side","price","amount","pnl_eur"]
     if not TRADES.exists():
         return pd.DataFrame(columns=cols)
+
     df = pd.read_csv(TRADES)
 
-    if "pair" not in df.columns and "symbol" in df.columns: df.rename(columns={"symbol":"pair"}, inplace=True)
-    if "price" not in df.columns and "avg_price" in df.columns: df.rename(columns={"avg_price":"price"}, inplace=True)
-    if "amount" not in df.columns and "qty" in df.columns: df.rename(columns={"qty":"amount"}, inplace=True)
-    if "pnl_eur" not in df.columns: df["pnl_eur"] = 0.0
+    if "pair" not in df.columns and "symbol" in df.columns:
+        df.rename(columns={"symbol":"pair"}, inplace=True)
+    if "price" not in df.columns and "avg_price" in df.columns:
+        df.rename(columns={"avg_price":"price"}, inplace=True)
+    if "amount" not in df.columns and "qty" in df.columns:
+        df.rename(columns={"qty":"amount"}, inplace=True)
+    if "pnl_eur" not in df.columns:
+        df["pnl_eur"] = 0.0
 
     for c in cols:
         if c not in df.columns:
             df[c] = "" if c in ("timestamp","pair","side") else 0.0
+
     for c in ("price","amount","pnl_eur"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
@@ -48,17 +55,14 @@ def main():
     print(f"{BOLD}==> LIVE RAPPORT == {ts()}{RESET}")
     df = load_trades()
     if df.empty:
-        print("Nog geen trades.")
-        return
+        print("Nog geen trades."); return
 
     closes = df[df["is_close"]].copy()
     if closes.empty:
-        print("Nog geen afgesloten posities.")
-        return
+        print("Nog geen afgesloten posities."); return
 
     today = datetime.now().date()
     days = [today - timedelta(days=i) for i in range(0, 10)]
-
     print("\n-- Dagelijkse winst (laatste 10 dagen) --")
     for d in sorted(days):
         pnl_dag = float(closes[closes["date"] == d]["pnl_eur"].sum() or 0.0)
@@ -66,7 +70,7 @@ def main():
 
     d7 = today - timedelta(days=6)
     d30 = today - timedelta(days=29)
-    pnl_7  = float(closes[(closes["date"] >= d7)  & (closes["date"] <= today)]["pnl_eur"].sum() or 0.0)
+    pnl_7  = float(closes[(closes["date"] >= d7) & (closes["date"] <= today)]["pnl_eur"].sum() or 0.0)
     pnl_30 = float(closes[(closes["date"] >= d30) & (closes["date"] <= today)]["pnl_eur"].sum() or 0.0)
 
     print("\n-- Periode winst --")
@@ -93,7 +97,7 @@ def main():
             dd  = r.get("timestamp","")
             sym = r.get("pair","?")
             side= r.get("side","")
-            px  = float(r.get("price",0) or 0)
+            px  = float(r.get("price",0)  or 0)
             amt = float(r.get("amount",0) or 0)
             pnl = float(r.get("pnl_eur",0) or 0)
             print(f"{dd} | {sym:<10} | {side:<12} | €{px:.6f} | {amt:.6f} | pnl={color_amt(pnl)}")
