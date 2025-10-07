@@ -10,7 +10,7 @@ API_KEY   = os.getenv("API_KEY", "")
 API_SECRET= os.getenv("API_SECRET", "")
 
 # Treat blank or all-zero operator IDs as None (Bitvavo eist anders een echte ID)
-_op = os.getenv("OPERATOR_ID", "").strip()
+_op = os.getenv("OPERATOR_ID", "0000000000").strip()
 OPERATOR_ID = None if (not _op or _op.strip("0") == "") else _op
 
 EXCHANGE = os.getenv("EXCHANGE", "bitvavo").lower()
