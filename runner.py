@@ -1,5 +1,5 @@
 # runner.py — start live_grid.py en maak periodiek een rapport
-import os, time, sys, subprocess, csv
+import csv, os, subprocess, sys, time
 from pathlib import Path
 
 REPORT_EVERY_HOURS = float(os.getenv("REPORT_EVERY_HOURS","4"))
