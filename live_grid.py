@@ -2,7 +2,7 @@
 # live_grid.py  (Bitvavo)
 # =========================
 # Milieuvariabelen (Render/Docker):
-# API_KEY, API_SECRET, OPERATOR_ID (optioneel, "0000000000" of leeg = uit)
+# API_KEY, API_SECRET, OPERATOR_ID (optioneel, leeg = uit, maar als je Bitvavo-operator whitelisting gebruikt is hij VERPLICHT)
 # EXCHANGE=bitvavo
 # COINS="BTC/EUR,ETH/EUR,SOL/EUR,XRP/EUR,LTC/EUR"
 # CAPITAL_EUR=1100
@@ -24,29 +24,26 @@
 # LOG_SUMMARY_SEC=240
 # SLEEP_SEC=3
 
-import os, sys, time, json, math, csv
-from pathlib import Path
+import csv, json, math, os, time
 from datetime import datetime, timezone
-from typing import List, Dict
+from pathlib import Path
+from typing import Dict, List
 import ccxt
 
 # ---------- ENV ----------
-API_KEY   = os.getenv("API_KEY","")
-API_SECRET= os.getenv("API_SECRET","")
+API_KEY    = os.getenv("API_KEY","").strip()
+API_SECRET = os.getenv("API_SECRET","").strip()
 
 # operatorId: alleen meesturen als je er echt één hebt
 _op = os.getenv("OPERATOR_ID","").strip()
-if _op in ("", "0", "0000000000"):
-    OPERATOR_ID = None
-else:
-    OPERATOR_ID = _op
+OPERATOR_ID = _op if _op not in ("", "0", "0000000000") else None
 
 EXCHANGE = os.getenv("EXCHANGE","bitvavo").lower()
 PAIRS    = [p.strip() for p in os.getenv("COINS","BTC/EUR,ETH/EUR").split(",") if p.strip()]
 
 CAPITAL_EUR  = float(os.getenv("CAPITAL_EUR","1100"))
 REINVEST_PROFITS = os.getenv("REINVEST_PROFITS","false").lower() in ("1","true","yes")
-REINVEST_THRESHOLD_EUR = float(os.getenv("REINVEST_THRESHOLD_EUR","0"))  # bv. 100
+REINVEST_THRESHOLD_EUR = float(os.getenv("REINVEST_THRESHOLD_EUR","0"))
 
 FEE_PCT        = float(os.getenv("FEE_PCT","0.0015"))
 GRID_LEVELS    = int(os.getenv("GRID_LEVELS","48"))
@@ -98,16 +95,28 @@ def make_exchange():
         "apiKey": API_KEY,
         "secret": API_SECRET,
         "enableRateLimit": True,
-        "options": {
-            "createMarketBuyOrderRequiresPrice": False,
-        },
+        "options": {"createMarketBuyOrderRequiresPrice": False},
     }
-    # OperatorId alleen meesturen als je een echte waarde hebt
-    if OPERATOR_ID:
-        opts["options"]["operatorId"] = OPERATOR_ID
 
     ex = ccxt.bitvavo(opts)
-    ex.load_markets()
+
+    # Zet operatorId expliciet waar Bitvavo het verwacht
+    if OPERATOR_ID:
+        # ccxt leest operatorId uit options voor sommige acties
+        ex.options = {**getattr(ex, "options", {}), "operatorId": OPERATOR_ID}
+        # en Bitvavo verwacht header BITVAVO-ACCESS-OPERATOR-ID
+        if not hasattr(ex, "headers") or not isinstance(ex.headers, dict):
+            ex.headers = {}
+        ex.headers["BITVAVO-ACCESS-OPERATOR-ID"] = OPERATOR_ID
+
+    try:
+        ex.load_markets()
+    except ccxt.BaseError as e:
+        # Als Bitvavo ‘operatorId required’ afdwingt, meteen duidelijk falen
+        msg = str(e)
+        if "operatorId" in msg.lower() and not OPERATOR_ID:
+            raise RuntimeError("Bitvavo vereist een geldige OPERATOR_ID voor jouw account. Zet OPERATOR_ID in de omgeving met de exacte waarde uit Bitvavo API-instellingen.") from e
+        raise
     return ex
 
 def fetch_mid(ex, pair):
@@ -172,18 +181,15 @@ def ticket_eur_for_pair(port, pair):
 # ---------- state ----------
 def init_state(ex):
     state = {
-        "portfolio": {
-            "pnl_realized": 0.0,
-            "coins": {p: {"qty": 0.0} for p in PAIRS}
-        },
+        "portfolio": {"pnl_realized": 0.0, "coins": {p: {"qty": 0.0} for p in PAIRS}},
         "pairs": {p: {"last_price": 0.0, "levels": [], "inventory_lots": []} for p in PAIRS},
         "baseline": {}
     }
-    # herstel indien aanwezig
     try:
         if STATE_JSON.exists():
             state.update(json.loads(STATE_JSON.read_text(encoding="utf-8")))
-    except: pass
+    except: 
+        pass
 
     if LOCK_PREEXISTING_BALANCE and not state["baseline"]:
         bal = ex.fetch_balance()
@@ -306,7 +312,6 @@ def process_pair(ex, pair, state, out: List[str]):
             for L in crossed:
                 min_quote, min_base = market_mins(ex, pair)
 
-                # beleid: altijd minstens buffer + min_quote laten staan
                 if freeE < (BUY_FREE_EUR_MIN + MIN_CASH_BUFFER_EUR):
                     out.append(f"[{pair}] BUY skip: policy free_EUR<€{BUY_FREE_EUR_MIN:.2f} (buffer €{MIN_CASH_BUFFER_EUR:.2f}).")
                     continue
@@ -377,7 +382,6 @@ def main():
             time.sleep(SLEEP_SEC)
 
         except ccxt.BaseError as e:
-            # o.a. netwerk, rate-limit; of operatorId-eis als je die per ongeluk verplicht hebt gezet
             print(f"[exchange] {e}")
             time.sleep(2)
         except KeyboardInterrupt:
