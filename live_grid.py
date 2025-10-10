@@ -36,7 +36,7 @@ API_SECRET = os.getenv("API_SECRET","").strip()
 
 # operatorId: alleen meesturen als je er echt één hebt
 _op = os.getenv("OPERATOR_ID","").strip()
-OPERATOR_ID = _op if _op not in ("", "0", "12234") else None
+OPERATOR_ID = _op if _op not in ("", "0", "0000000000") else None
 
 EXCHANGE = os.getenv("EXCHANGE","bitvavo").lower()
 PAIRS    = [p.strip() for p in os.getenv("COINS","BTC/EUR,ETH/EUR").split(",") if p.strip()]
