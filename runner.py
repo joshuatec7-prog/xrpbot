@@ -1,4 +1,3 @@
-# runner.py — start live_grid.py en maak periodiek een rapport
 import csv, os, subprocess, sys, time
 from pathlib import Path
 
@@ -40,7 +39,7 @@ def main():
     try:
         while True:
             if grid.poll() is not None:
-                print("[runner] grid gestopt; opnieuw starten …", flush=True)
+                print(f"[runner] grid gestopt; exitcode={grid.returncode}; opnieuw starten …", flush=True)
                 time.sleep(2)
                 grid = start_grid()
 
