@@ -1,7 +1,4 @@
 __pycache__/
 *.pyc
-bot.log
-bot.log.*
-trades.csv
-equity.csv
-state.json
+data/
+bot.log*
