@@ -1,10 +1,9 @@
 # =========================
 # live_grid.py  (Bitvavo)
 # =========================
-# Vereiste env-variabelen (Render/Docker):
+# ENV:
 # API_KEY, API_SECRET
-# Optioneel: OPERATOR_ID  → alleen invullen als Bitvavo die voor jouw key vereist
-# Overig:
+# OPERATOR_ID (optioneel, vereist als Bitvavo dat afdwingt; moet numeriek zijn)
 # EXCHANGE=bitvavo
 # COINS="BTC/EUR,ETH/EUR,SOL/EUR,XRP/EUR,LTC/EUR"
 # CAPITAL_EUR=1100
@@ -40,8 +39,8 @@ import ccxt
 API_KEY = os.getenv("API_KEY", "").strip()
 API_SECRET = os.getenv("API_SECRET", "").strip()
 
-_op = os.getenv("OPERATOR_ID", "").strip()
-OPERATOR_ID = _op if _op not in ("", "0", "0000000000") else None
+_raw_op = os.getenv("OPERATOR_ID", "").strip()
+OPERATOR_ID = int(_raw_op) if _raw_op.isdigit() and _raw_op != "0" else None  # als getal
 
 EXCHANGE = os.getenv("EXCHANGE", "bitvavo").lower()
 PAIRS = [p.strip() for p in os.getenv("COINS", "BTC/EUR,ETH/EUR").split(",") if p.strip()]
@@ -75,14 +74,13 @@ LOG_SUMMARY_SEC = int(os.getenv("LOG_SUMMARY_SEC", "240"))
 
 COL_B = "\033[1m"; COL_C = "\033[96m"; COL_G = "\033[92m"; COL_R = "\033[91m"; COL_0 = "\033[0m"
 
-# ---------- operator-id guard ----------
+# ---------- operator guard ----------
 def _guard_operator_error(exc: Exception):
     msg = str(exc).lower()
     if "operatorid" in msg and "required" in msg:
         raise SystemExit(
-            "Bitvavo meldt: operatorId is vereist voor deze API-key. "
-            "Oplossing: gebruik een normale Bitvavo API-key zonder operator-verplichting "
-            "of vul een geldige OPERATOR_ID in de omgeving."
+            "Bitvavo meldt: operatorId vereist voor deze API-key. "
+            "Gebruik een normale key of zet een geldige numerieke OPERATOR_ID."
         )
 
 # ---------- helpers ----------
@@ -119,11 +117,9 @@ def make_exchange():
         }
     )
 
-    if OPERATOR_ID:
+    # ccxt kan operatorId uit options lezen, maar Bitvavo wil hem ook in de body.
+    if OPERATOR_ID is not None:
         ex.options = {**getattr(ex, "options", {}), "operatorId": OPERATOR_ID}
-        if not hasattr(ex, "headers") or not isinstance(ex.headers, dict):
-            ex.headers = {}
-        ex.headers["BITVAVO-ACCESS-OPERATOR-ID"] = OPERATOR_ID
 
     try:
         ex.load_markets()
@@ -147,17 +143,28 @@ def best_ask(ex, pair: str) -> float:
 def amount_to_precision(ex, pair: str, a: float) -> float:
     return float(ex.amount_to_precision(pair, a))
 
-# private-call wrappers met operator guard
+# extra params helper
+def _op_params(extra: dict | None = None) -> dict:
+    if OPERATOR_ID is None:
+        return extra or {}
+    base = {"operatorId": OPERATOR_ID}  # als integer
+    if extra:
+        base.update(extra)
+    return base
+
+# private-call wrappers
 def _fetch_balance(ex):
     try:
-        return ex.fetch_balance()
+        # Bitvavo wil operatorId op ALLE endpoints bij operator-keys
+        return ex.fetch_balance(_op_params())
     except ccxt.BaseError as e:
         _guard_operator_error(e)
         raise
 
 def _create_order(ex, *args, **kwargs):
+    params = kwargs.pop("params", {})
     try:
-        return ex.create_order(*args, **kwargs)
+        return ex.create_order(*args, params=_op_params(params), **kwargs)
     except ccxt.BaseError as e:
         _guard_operator_error(e)
         raise
