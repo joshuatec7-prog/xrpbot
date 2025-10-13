@@ -1,12 +1,12 @@
 # =========================
-# live_grid.py — Bitvavo GRID met winstbescherming
+# live_grid.py — Bitvavo GRID met winstbescherming en heldere logging
 # =========================
-# ENV (exacte namen)
+# ENV (exacte namen) — voorbeelden tussen haakjes
 # API_KEY, API_SECRET
-# OPERATOR_ID                # optioneel; numeriek; alleen zetten als Bitvavo het vereist
+# OPERATOR_ID                 # optioneel; numeriek; alleen zetten als Bitvavo het vereist
 # ALLOW_BUYS=true
 # BAND_PCT=0.06
-# BE_SAFETY_PCT=0.0005       # break-even buffer (0.05%)
+# BE_SAFETY_PCT=0.0005        # break-even buffer na winst (0.05%)
 # BUY_FREE_EUR_MIN=100
 # CAPITAL_EUR=1100
 # COINS=BTC/EUR,ETH/EUR,SOL/EUR,XRP/EUR,DOGE/EUR
@@ -18,14 +18,15 @@
 # LOG_SUMMARY_SEC=240
 # MIN_CASH_BUFFER_EUR=25
 # MIN_PROFIT_EUR=0.06
-# MIN_PROFIT_PCT=0.006       # 0.6%
+# MIN_PROFIT_PCT=0.006        # 0.6% boven fees/slippage
 # MIN_QUOTE_EUR=5
 # ORDER_SIZE_FACTOR=2.5
 # REINVEST_PROFITS=true
 # REINVEST_THRESHOLD_EUR=100
 # SLEEP_SEC=3
 # SELL_SAFETY_PCT=0.0015
-# TRAIL_PROFIT_PCT=0.004     # 0.4%
+# TRAIL_PROFIT_PCT=0.004      # 0.4% vanaf piek
+# SELL_BASELINE_PROTECT=false  # als true, blokkeer SELL bij baseline-protect
 
 import csv, json, os, sys, time, traceback
 from datetime import datetime, timezone
@@ -37,7 +38,7 @@ import ccxt
 API_KEY   = os.getenv("API_KEY","").strip()
 API_SECRET= os.getenv("API_SECRET","").strip()
 _raw_op   = os.getenv("OPERATOR_ID","").strip()
-OPERATOR_ID = int(_raw_op) if _raw_op.isdigit() and _raw_op!="0" else None
+OPERATOR_ID = int(_raw_op) if _raw_op.isdigit() and _raw_op != "0" else None
 
 EXCHANGE  = os.getenv("EXCHANGE","bitvavo").lower()
 PAIRS     = [p.strip() for p in os.getenv("COINS","BTC/EUR,ETH/EUR").split(",") if p.strip()]
@@ -58,7 +59,9 @@ MIN_QUOTE_EUR       = float(os.getenv("MIN_QUOTE_EUR","5"))
 MIN_CASH_BUFFER_EUR = float(os.getenv("MIN_CASH_BUFFER_EUR","25"))
 BUY_FREE_EUR_MIN    = float(os.getenv("BUY_FREE_EUR_MIN","100"))
 ALLOW_BUYS          = os.getenv("ALLOW_BUYS","true").lower() in ("1","true","yes")
+
 LOCK_PREEXISTING_BALANCE = os.getenv("LOCK_PREEXISTING_BALANCE","false").lower() in ("1","true","yes")
+SELL_BASELINE_PROTECT    = os.getenv("SELL_BASELINE_PROTECT","false").lower() in ("1","true","yes")
 
 TRAIL_PROFIT_PCT = float(os.getenv("TRAIL_PROFIT_PCT","0.004"))
 BE_SAFETY_PCT    = float(os.getenv("BE_SAFETY_PCT","0.0005"))
@@ -117,7 +120,7 @@ def best_bid(ex, pair): return to_num(ex.fetch_ticker(pair).get("bid"),0.0)
 def best_ask(ex, pair): return to_num(ex.fetch_ticker(pair).get("ask"),0.0)
 def amount_to_precision(ex, pair, a): return float(ex.amount_to_precision(pair, a))
 
-# alleen bij orders operatorId meesturen
+# Alleen bij orders operatorId meesturen
 def _create_order(ex, *args, **kwargs):
     params = kwargs.pop("params", {})
     if OPERATOR_ID is not None:
@@ -248,10 +251,9 @@ def process_pair(ex, pair, state, out: List[str]):
 
             if qty < min_base or (qty*px) < min_quote:
                 out.append(f"[{pair}] SELL skip: lot te klein"); break
-            if allowed is not None and allowed + 1e-12 < qty:
+            if SELL_BASELINE_PROTECT and allowed is not None and allowed + 1e-12 < qty:
                 out.append(f"[{pair}] SELL stop: baseline-protect"); break
 
-            # arming zodra winstdrempel gehaald is
             if not armed and bid >= lot["buy_price"] * (1 + MIN_PROFIT_PCT):
                 lot["armed"] = True
                 armed = True
@@ -266,11 +268,12 @@ def process_pair(ex, pair, state, out: List[str]):
             else:
                 out.append(f"[{pair}] SELL wait: bid €{bid:.4f} < trg €{trg:.4f} (peak €{lot['peak']:.4f})"); break
 
+            buy_px = float(lot["buy_price"])
             proceeds, avg, fee = sell_market(ex, pair, amount_to_precision(ex, pair, qty))
             if proceeds <= 0 or avg <= 0:
                 out.append(f"[{pair}] SELL fail: geen fill."); break
 
-            pnl = proceeds - fee - (qty * lot["buy_price"] * (1 + FEE_PCT))
+            pnl = proceeds - fee - (qty * buy_px * (1 + FEE_PCT))
             port["pnl_realized"] = to_num(port.get("pnl_realized",0.0)) + pnl
             port["coins"][pair]["qty"] = to_num(port["coins"][pair]["qty"]) - qty
             ps["inventory_lots"].pop(0)
@@ -279,11 +282,11 @@ def process_pair(ex, pair, state, out: List[str]):
             append_csv(
                 TRADES_CSV,
                 [now_iso(), pair, "SELL", f"{avg:.6f}", f"{qty:.8f}", f"{proceeds:.2f}", "", base,
-                 f"{port['coins'][pair]['qty']:.8f}", f"{pnl:.2f}", sell_reason],
+                 f"{port['coins'][pair]['qty']:.8f}", f"{pnl:.2f}", f"{sell_reason};buy_px={buy_px:.6f}"],
                 header=["timestamp","pair","side","avg_price","qty","eur","cash_eur","base","base_qty","pnl_eur","comment"]
             )
             col = COL_G if pnl >= 0 else COL_R
-            out.append(f"{col}[{pair}] SELL {qty:.8f} @ €{avg:.6f} | pnl=€{pnl:.2f} | reason={sell_reason}{COL_0}")
+            out.append(f"{col}[{pair}] CLOSE {qty:.8f} | BUY €{buy_px:.6f} → SELL €{avg:.6f} | pnl=€{pnl:.2f} | reason={sell_reason}{COL_0}")
             changed = True
 
     # BUY
