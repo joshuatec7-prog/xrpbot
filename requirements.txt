@@ -1,1 +1,2 @@
-# Placeholder for requirements.txt
+ccxt==4.2.100
+pandas>=2.2.2
